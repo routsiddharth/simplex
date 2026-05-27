@@ -1,0 +1,25 @@
+# Secrets — never bake into the image (set as Railway variables instead)
+.env
+.env.*
+*.pem
+
+# Local data / DuckDB (lives on the mounted volume in prod)
+data/
+*.duckdb
+*.duckdb.wal
+
+# Python caches / local venv / build artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# VCS / docs / OS cruft not needed in the image
+.git/
+.gitignore
+README-DEPLOY.md
+.DS_Store

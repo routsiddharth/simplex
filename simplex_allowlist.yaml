@@ -1,0 +1,18 @@
+series:
+- ticker: KXHOUSERACE
+  notes: House Race Winner? — 719 mkts / 358 evts, 358 mutex, 358 multi-mkt, vol 1,433,655
+- ticker: KXCAPRIMARY
+  notes: Who will advance in the CA primary? — 529 mkts / 95 evts, 51 mutex, 95 multi-mkt,
+    vol 1,183,239
+- ticker: KXITFMATCH
+  notes: ITF Men's Match — 168 mkts / 84 evts, 84 mutex, 84 multi-mkt, vol 655,001
+- ticker: KXWCGAME
+  notes: World Cup Game — 216 mkts / 72 evts, 72 mutex, 72 multi-mkt, vol 672,345
+- ticker: KXATPSETWINNER
+  notes: ATP Set Winner — 144 mkts / 72 evts, 72 mutex, 72 multi-mkt, vol 9,170
+- ticker: KXWCSTAGEOFELIM
+  notes: World Cup Stage of Elimination — 329 mkts / 47 evts, 47 mutex, 47 multi-mkt,
+    vol 105,381
+- ticker: KXVOTEPRIMARY
+  notes: Vote percentages in primaries — 271 mkts / 35 evts, 33 mutex, 35 multi-mkt,
+    vol 3,319,542

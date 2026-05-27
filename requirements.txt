@@ -1,0 +1,13 @@
+# Simplex stage 1 ingest — runtime dependencies.
+# Tuning knobs live in src/simplex_ingest/constants.py, not here.
+
+duckdb>=1.1           # embedded analytical store (single file on the mounted volume)
+websockets>=13.0      # Kalshi market-data WebSocket feed
+httpx>=0.27           # async Kalshi REST client
+cryptography>=43.0    # RSA-PSS request signing
+certifi>=2024.0       # CA bundle for the websockets TLS handshake
+pydantic>=2.7         # settings models
+pydantic-settings>=2.3  # env-var driven config
+python-dotenv>=1.0    # .env loading (incl. multi-line PEM secret)
+PyYAML>=6.0           # simplex_allowlist.yaml
+sortedcontainers>=2.4  # SortedDict order books
