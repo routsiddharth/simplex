@@ -4,19 +4,11 @@ This is the deployment layer only. The app is already env-driven, logs JSON to
 stdout, and shuts down cleanly on SIGTERM. Files: `Dockerfile`, `entrypoint.sh`,
 `railway.json`, `.dockerignore`.
 
-> **Heads-up (read this first):** `constants.py` hard-codes the health server to
-> port **8080** and does *not* read Railway's injected `$PORT`. Railway runs its
-> healthcheck against `$PORT`, so you **must set a `PORT=8080` service variable**
-> (below) or the healthcheck will fail. This is the one not-fully-deployment-clean
-> spot — if you'd rather the health server bind `$PORT` natively, that's a ~1-line
-> change to `health.py`/`constants.py`; say the word and I'll do it.
-
----
-
 ## 1. Required service variables
 
-Set these in the Railway service's **Variables** tab (or via CLI). There are
-**five** — the four from the spec plus `PORT`:
+Set these in the Railway service's **Variables** tab (or via CLI). The four from
+the spec are all you need — the health server binds Railway's injected `$PORT`
+automatically (falling back to 8080 if unset):
 
 | Variable | Value | Notes |
 |---|---|---|
@@ -24,7 +16,6 @@ Set these in the Railway service's **Variables** tab (or via CLI). There are
 | `KALSHI_API_SECRET` | the RSA private key (PEM) | multi-line — see below |
 | `KALSHI_ENV` | `prod` or `demo` | |
 | `SIMPLEX_DATA_DIR` | `/data` | must match the volume mount path |
-| `PORT` | `8080` | tells Railway which port to healthcheck |
 
 ### Setting the multi-line PEM (`KALSHI_API_SECRET`)
 
@@ -42,7 +33,7 @@ one line. So a paste that loses formatting will still work.
 CLI alternative for the simple ones:
 ```bash
 railway variables --set "KALSHI_API_KEY_ID=..." --set "KALSHI_ENV=prod" \
-                  --set "SIMPLEX_DATA_DIR=/data" --set "PORT=8080"
+                  --set "SIMPLEX_DATA_DIR=/data"
 ```
 (Do the PEM through the UI — multi-line values are painful to pass through a shell.)
 

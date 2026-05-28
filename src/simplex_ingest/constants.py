@@ -218,7 +218,9 @@ backs off up to the max; a loop that runs cleanly for a while resets its
 backoff."""
 
 HEALTH_PORT = 8080
-"""Port for the /health endpoint. 200 if all four loops are alive, 503 otherwise."""
+"""Default port for the /health endpoint. 200 if all four loops are alive, 503
+otherwise. Overridden at runtime by the ``$PORT`` env var if the host platform
+injects one (Railway, Heroku, etc) — see :func:`health.start_health_server`."""
 
 HEALTH_HEARTBEAT_TIMEOUT_SECONDS = 90.0
 """A loop is 'alive' for /health if it has emitted a heartbeat within this

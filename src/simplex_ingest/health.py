@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from . import constants as C
 from .log import get_logger
@@ -44,7 +45,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, he
         writer.close()
 
 
-async def start_health_server(heartbeats: Heartbeats, port: int = C.HEALTH_PORT) -> asyncio.AbstractServer:
+async def start_health_server(heartbeats: Heartbeats, port: int | None = None) -> asyncio.AbstractServer:
+    # Honor $PORT if the host platform injects one (Railway, Heroku, etc);
+    # otherwise fall back to the constant. Explicit arg always wins.
+    if port is None:
+        env_port = os.environ.get("PORT")
+        port = int(env_port) if env_port else C.HEALTH_PORT
     server = await asyncio.start_server(
         lambda r, w: _handle(r, w, heartbeats), host="0.0.0.0", port=port
     )
