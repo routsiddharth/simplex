@@ -17,7 +17,7 @@ from .runtime import Heartbeats
 
 log = get_logger("health")
 
-LOOP_NAMES = ["catalog", "websocket", "snapshot", "audit"]
+LOOP_NAMES = ["catalog", "websocket", "snapshot", "audit", "discovery"]
 
 
 async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, heartbeats: Heartbeats) -> None:

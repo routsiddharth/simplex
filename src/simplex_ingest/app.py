@@ -23,6 +23,7 @@ from .kalshi.subscriber import KalshiSubscriber
 from .log import configure_logging, get_logger
 from .loops.audit import BookAuditLoop
 from .loops.catalog import CatalogPoller
+from .loops.discovery import DiscoveryLoop
 from .loops.snapshots import SnapshotBuilder
 from .loops.websocket import WebSocketLoop
 from .runtime import BookStore, Heartbeats
@@ -98,7 +99,13 @@ async def run() -> int:
 
     rt = build_runtime(settings)
     builder = SnapshotBuilder(rt)
-    loops: list[Any] = [CatalogPoller(rt), WebSocketLoop(rt), builder, BookAuditLoop(rt)]
+    loops: list[Any] = [
+        CatalogPoller(rt),
+        WebSocketLoop(rt),
+        builder,
+        BookAuditLoop(rt),
+        DiscoveryLoop(rt),
+    ]
 
     _install_signal_handlers(asyncio.get_running_loop(), rt.shutdown)
     health_server = await start_health_server(rt.heartbeats)

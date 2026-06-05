@@ -75,3 +75,19 @@ CREATE TABLE IF NOT EXISTS audit_results (
     details_json       JSON
 );
 CREATE INDEX IF NOT EXISTS idx_audit_market_ts ON audit_results (market_id, ts);
+
+-- Self-managed tracked set: which series the catalog poller expands into the
+-- active subscription set. Rewritten atomically by the discovery loop each cycle
+-- (admit/rank by predicates). Replaces the human-curated simplex_allowlist.yaml.
+CREATE TABLE IF NOT EXISTS tracked_series (
+    series_ticker      VARCHAR PRIMARY KEY,
+    admitted_at        TIMESTAMP,        -- first admission; preserved across re-admits
+    last_check_at      TIMESTAMP,        -- most recent discovery cycle that admitted it
+    passes_p1          BOOLEAN,          -- partition predicate
+    passes_p2          BOOLEAN,          -- hierarchy predicate
+    passes_p3          BOOLEAN,          -- tradeability predicate
+    n_partition_events INTEGER,
+    n_hierarchy_events INTEGER,
+    volume_24h         DOUBLE,
+    rank_position      INTEGER           -- 1..MAX_TRACKED_SERIES, best first
+);

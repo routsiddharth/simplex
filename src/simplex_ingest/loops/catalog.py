@@ -15,7 +15,7 @@ import json
 from .. import constants as C
 from ..allowlist import load_allowlist
 from ..log import get_logger
-from ..util import now_utc, parse_dt, naive_utc
+from ..util import market_volume, now_utc, parse_dt, naive_utc
 
 log = get_logger("catalog")
 
@@ -48,17 +48,6 @@ def _market_row(market: dict, event: dict, platform: str) -> tuple:
         json.dumps(market, default=str),
         naive_utc(now_utc()),
     )
-
-
-def _market_volume(market: dict) -> float:
-    for key in ("volume_fp", "volume", "volume_24h_fp"):
-        v = market.get(key)
-        if v is not None:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                pass
-    return 0.0
 
 
 class CatalogPoller:
@@ -115,7 +104,7 @@ class CatalogPoller:
                 for market in event.get("markets") or []:
                     if market.get("status") not in _TRADEABLE:
                         continue
-                    if _market_volume(market) < C.CATALOG_MIN_MARKET_VOLUME:
+                    if market_volume(market) < C.CATALOG_MIN_MARKET_VOLUME:
                         continue
                     ticker = market.get("ticker")
                     if not ticker:

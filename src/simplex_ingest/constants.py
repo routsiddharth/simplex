@@ -176,6 +176,34 @@ threshold the diff is 'large': warn + forced book reset."""
 
 
 # --------------------------------------------------------------------------
+# Discovery loop (predicate-based, self-managing tracked set)
+# --------------------------------------------------------------------------
+
+DISCOVERY_INTERVAL_SECONDS = 3600
+"""How often the discovery loop sweeps all open Kalshi series, re-evaluates the
+predicates, and rewrites the `tracked_series` table. The catalog poller picks up
+the new set within one CATALOG_REFRESH_SECONDS afterward. 1 h balances catalog
+churn against the full-events REST sweep cost."""
+
+MAX_TRACKED_SERIES = 30
+"""Hard cap on the tracked set. Admitted series beyond this are evicted worst-
+first by `rank_key`. Bounds the WS subscription firehose."""
+
+PREDICATE_PARTITION_MIN_MARKETS = 3
+"""P1: a mutually-exclusive event needs at least this many tradeable markets to
+count as a partition. Below this it's too thin to be a useful coherence
+constraint."""
+
+PREDICATE_HIERARCHY_MIN_MARKETS = 2
+"""P2: an event needs at least this many *distinct* markets (distinct subtitle /
+strike) to count as a hierarchy."""
+
+PREDICATE_MIN_VOLUME_24H = 1000.0
+"""P3: a series' summed tradeable-market volume must reach this floor (contracts)
+to be admitted — internal structure is worthless if nobody trades it."""
+
+
+# --------------------------------------------------------------------------
 # Discovery script scoring (scripts/discover_series.py)
 # --------------------------------------------------------------------------
 

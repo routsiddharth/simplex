@@ -83,6 +83,21 @@ _AUDIT_INSERT = (
     "max_size_delta_pct, action_taken, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)"
 )
 
+_TRACKED_UPSERT = """
+INSERT INTO tracked_series (series_ticker, admitted_at, last_check_at, passes_p1,
+    passes_p2, passes_p3, n_partition_events, n_hierarchy_events, volume_24h, rank_position)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (series_ticker) DO UPDATE SET
+    last_check_at = EXCLUDED.last_check_at,
+    passes_p1 = EXCLUDED.passes_p1,
+    passes_p2 = EXCLUDED.passes_p2,
+    passes_p3 = EXCLUDED.passes_p3,
+    n_partition_events = EXCLUDED.n_partition_events,
+    n_hierarchy_events = EXCLUDED.n_hierarchy_events,
+    volume_24h = EXCLUDED.volume_24h,
+    rank_position = EXCLUDED.rank_position
+"""  # NB: admitted_at deliberately untouched on conflict (preserved from first admit).
+
 
 class Database:
     def __init__(self, path: Path) -> None:
@@ -165,6 +180,48 @@ class Database:
                 "SELECT market_id, status FROM markets WHERE subscribed = TRUE"
             ).fetchall()
         return [{"market_id": r[0], "status": r[1]} for r in rows]
+
+    # -- tracked_series -----------------------------------------------------
+
+    def get_tracked_series(self) -> list[str]:
+        """Tracked series tickers in rank order (best first). [] if empty."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT series_ticker FROM tracked_series ORDER BY rank_position"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def replace_tracked_series(self, rows: list[tuple[Any, ...]]) -> None:
+        """Atomically swap the tracked set to exactly ``rows``.
+
+        Each row is
+        ``(series_ticker, admitted_at, last_check_at, p1, p2, p3,
+        n_partition_events, n_hierarchy_events, volume_24h, rank_position)``;
+        ``admitted_at`` is the discovery cycle's "now" and is used only for
+        rows new to the table — existing rows keep their original
+        ``admitted_at`` (the upsert leaves it untouched). The whole swap runs in
+        one transaction: any bad row rolls the table back to its prior contents.
+
+        An empty ``rows`` would wipe the table, so callers must guard against
+        replacing on a transient empty sweep (see the discovery loop).
+        """
+        if not rows:
+            return
+        norm = [(r[0], naive_utc(r[1]), naive_utc(r[2]), *r[3:]) for r in rows]
+        keep = [r[0] for r in norm]
+        placeholders = ", ".join("?" * len(keep))
+        with self._lock:
+            self._con.execute("BEGIN TRANSACTION")
+            try:
+                self._con.executemany(_TRACKED_UPSERT, norm)
+                self._con.execute(
+                    f"DELETE FROM tracked_series WHERE series_ticker NOT IN ({placeholders})",
+                    keep,
+                )
+                self._con.execute("COMMIT")
+            except Exception:
+                self._con.execute("ROLLBACK")
+                raise
 
     # -- snapshots ----------------------------------------------------------
 

@@ -49,6 +49,22 @@ def parse_dt(value: object) -> datetime | None:
     return None
 
 
+def market_volume(market: dict) -> float:
+    """Best-effort contract volume for a Kalshi market.
+
+    Prefer the fixed-point ``volume_fp``, then plain ``volume``, then the 24h
+    fixed-point figure. Shared by the catalog poller (liquidity floor) and the
+    discovery predicates (P3 tradeability)."""
+    for key in ("volume_fp", "volume", "volume_24h_fp"):
+        v = market.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 def floor_to_interval(dt: datetime, seconds: int) -> datetime:
     """Floor ``dt`` down to the nearest ``seconds`` grid boundary (naive UTC)."""
     dt = naive_utc(dt)
