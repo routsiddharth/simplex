@@ -1,5 +1,10 @@
 # Deploying Simplex stage 1 ingest to Railway
 
+> **Canonical deploy doc is now [`docs/DEPLOY.md`](./docs/DEPLOY.md)** — it is the
+> maintained superset (env, volume, deploy methods, verification, rollback,
+> scaling constraints, future topology). This file remains as the original
+> Railway-setup quickstart; prefer `docs/DEPLOY.md` when they differ.
+
 This is the deployment layer only. The app is already env-driven, logs JSON to
 stdout, and shuts down cleanly on SIGTERM. Files: `Dockerfile`, `entrypoint.sh`,
 `railway.json`, `.dockerignore`.
