@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import constants as C
-from .allowlist import AllowlistError, require_allowlist
 from .config import Settings, get_settings
 from .db import Database
 from .health import start_health_server
@@ -84,18 +83,29 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.
             signal.signal(sig, lambda *_: shutdown.set())
 
 
+async def _warn_if_discovery_stalled(rt: Runtime) -> None:
+    """After a startup grace, warn once if discovery still hasn't populated.
+
+    Self-terminates on shutdown. An empty tracked set past the grace means the
+    discovery loop is failing (REST down / bad creds), not a slow boot — the WS
+    set stays idle but the process keeps running."""
+    try:
+        await asyncio.wait_for(rt.shutdown.wait(), timeout=C.DISCOVERY_STARTUP_GRACE_SECONDS)
+        return  # shutdown arrived first
+    except asyncio.TimeoutError:
+        pass
+    tracked = await asyncio.to_thread(rt.db.get_tracked_series)
+    if not tracked:
+        log.warning(
+            "tracked_series still empty after startup grace; WS idle until discovery populates",
+            extra={"grace_s": C.DISCOVERY_STARTUP_GRACE_SECONDS},
+        )
+
+
 async def run() -> int:
     settings = get_settings()
     configure_logging(C.LOG_LEVEL)
     log.info("starting simplex ingest", extra={"env": settings.env, "db": str(settings.db_path)})
-
-    try:
-        entries = require_allowlist()
-    except AllowlistError as exc:
-        log.error("fatal: allowlist", extra={"detail": str(exc)})
-        print(str(exc))  # also to plain stderr-ish stdout for operators
-        return 1
-    log.info("allowlist loaded", extra={"series": len(entries)})
 
     rt = build_runtime(settings)
     builder = SnapshotBuilder(rt)
@@ -111,13 +121,15 @@ async def run() -> int:
     health_server = await start_health_server(rt.heartbeats)
 
     supervisor_task = asyncio.create_task(run_supervised(loops, rt.shutdown), name="supervisor")
+    grace_task = asyncio.create_task(_warn_if_discovery_stalled(rt), name="discovery-grace")
 
     await rt.shutdown.wait()
     log.info("shutting down")
 
     # 1) cancel loops
     supervisor_task.cancel()
-    await asyncio.gather(supervisor_task, return_exceptions=True)
+    grace_task.cancel()
+    await asyncio.gather(supervisor_task, grace_task, return_exceptions=True)
 
     # 2) flush pending writes, 3) checkpoint books, 4) close DB
     try:

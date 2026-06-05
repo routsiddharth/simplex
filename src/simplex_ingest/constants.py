@@ -202,6 +202,12 @@ PREDICATE_MIN_VOLUME_24H = 1000.0
 """P3: a series' summed tradeable-market volume must reach this floor (contracts)
 to be admitted — internal structure is worthless if nobody trades it."""
 
+DISCOVERY_STARTUP_GRACE_SECONDS = 90.0
+"""On a cold boot, how long to wait before warning that `tracked_series` is still
+empty. Discovery populates it eagerly within seconds of start, so an empty table
+past this grace means discovery is failing (REST down, bad creds) and the WS set
+will stay idle. Informational — the process stays up either way."""
+
 
 # --------------------------------------------------------------------------
 # Discovery script scoring (scripts/discover_series.py)

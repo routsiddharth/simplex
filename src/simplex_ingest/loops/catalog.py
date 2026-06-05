@@ -1,10 +1,11 @@
 """Catalog poller loop.
 
-Every CATALOG_REFRESH_SECONDS: re-read simplex_allowlist.yaml, expand each
-series to its open markets via Kalshi REST, filter by status/liquidity, upsert
-into `markets`, set the active subscription set, and signal the WS loop to
-reconcile. Closed/removed markets keep their rows (and history); only their
-`subscribed` flag flips to false.
+Every CATALOG_REFRESH_SECONDS: read the tracked series from the `tracked_series`
+table (maintained by the discovery loop), expand each series to its open markets
+via Kalshi REST, filter by status/liquidity, upsert into `markets`, set the
+active subscription set, and signal the WS loop to reconcile. Closed/removed
+markets keep their rows (and history); only their `subscribed` flag flips to
+false.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import asyncio
 import json
 
 from .. import constants as C
-from ..allowlist import load_allowlist
 from ..log import get_logger
 from ..util import market_volume, now_utc, parse_dt, naive_utc
 
@@ -77,9 +77,11 @@ class CatalogPoller:
             remaining -= step
 
     async def refresh(self) -> None:
-        entries = load_allowlist()
-        if not entries:
-            log.error("allowlist is empty; no markets will be subscribed")
+        series_list = await asyncio.to_thread(self.rt.db.get_tracked_series)
+        if not series_list:
+            # Soft fail: discovery hasn't populated yet (or admitted nothing). The
+            # WS set stays as-is until the next tick finds a tracked set.
+            log.warning("no tracked series; WS will be idle until discovery populates")
             return
 
         platform = self.rt.subscriber.platform
@@ -87,17 +89,14 @@ class CatalogPoller:
         rows: list[tuple] = []
         kept = 0
 
-        for entry in entries:
-            series = entry.ticker
+        for series in series_list:
             events = await self.rt.rest.get_events(
                 status="open", series_ticker=series, with_nested_markets=True
             )
             if not events:
-                # Distinguish a typo'd/resolved series from one with no open markets.
-                if await self.rt.rest.get_series(series) is None:
-                    log.warning("allowlist series not found on Kalshi", extra={"series": series})
-                else:
-                    log.info("allowlist series has no open events", extra={"series": series})
+                # Discovery only tracks series with open structure, so an empty
+                # result here is just a transient gap, not a bad ticker.
+                log.info("tracked series has no open events", extra={"series": series})
                 continue
 
             for event in events:
@@ -118,5 +117,5 @@ class CatalogPoller:
         self.rt.resubscribe_event.set()
         log.info(
             "catalog refreshed",
-            extra={"series": len(entries), "active_markets": kept},
+            extra={"series": len(series_list), "active_markets": kept},
         )
