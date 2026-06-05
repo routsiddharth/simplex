@@ -51,19 +51,15 @@ shifts — note it in your analysis."""
 # --------------------------------------------------------------------------
 
 CATALOG_REFRESH_SECONDS = 300
-"""How often the catalog poller re-reads simplex_allowlist.yaml, re-expands it
-against Kalshi REST, and reconciles the active subscription set. 5 min balances
-freshness of newly-opened markets against REST budget."""
-
-ALLOWLIST_FILENAME = "simplex_allowlist.yaml"
-"""Allowlist file, resolved relative to the current working directory (repo
-root). Single source of truth for which series we ingest. Re-read every
-refresh, so edits take effect without a restart."""
+"""How often the catalog poller re-reads the `tracked_series` table (maintained
+by the discovery loop), re-expands it against Kalshi REST, and reconciles the
+active subscription set. 5 min balances freshness of newly-opened markets and
+of discovery's latest tracked set against REST budget."""
 
 CATALOG_MIN_MARKET_VOLUME = 0.0
 """Liquidity floor (contracts) for a market to enter the active set. 0.0 keeps
-every open market in the allowlisted series. Raise to prune dead markets and
-shrink the WS firehose. Applied in the catalog poller."""
+every open market in a tracked series. Raise to prune dead markets and shrink
+the WS firehose. Applied in the catalog poller."""
 
 
 # --------------------------------------------------------------------------
@@ -210,37 +206,6 @@ will stay idle. Informational — the process stays up either way."""
 
 
 # --------------------------------------------------------------------------
-# Discovery script scoring (scripts/discover_series.py)
-# --------------------------------------------------------------------------
-
-DISCOVERY_TOP_N = 10
-"""How many top-scoring series the discovery script writes to the allowlist."""
-
-DISCOVERY_MIN_LIQUIDITY_CONTRACTS = 1000.0
-"""Series whose summed recent volume is below this floor are penalized hard in
-scoring — structural density is worthless if nobody trades it."""
-
-DISCOVERY_WEIGHT_MARKET_COUNT = 1.0
-"""Weight on (log) count of open markets in the series."""
-
-DISCOVERY_WEIGHT_PARTITION = 3.0
-"""Weight on partition evidence (mutually-exclusive events / bucket titles that
-sum to a whole). Weighted highest: clean partitions are the richest coherence
-constraints."""
-
-DISCOVERY_WEIGHT_HIERARCHY = 2.0
-"""Weight on hierarchical evidence (events containing multiple related markets)."""
-
-DISCOVERY_WEIGHT_LIQUIDITY = 0.5
-"""Weight on (log) recent volume. Deliberately low: volume is a floor gate, not
-the headline ranking signal — internal structure matters more for coherence."""
-
-DISCOVERY_LOW_SCORE_FRACTION = 0.5
-"""When diffing against an existing allowlist, current entries scoring below
-this fraction of the Nth-place score are flagged as 'now scores low'."""
-
-
-# --------------------------------------------------------------------------
 # Supervisor / health
 # --------------------------------------------------------------------------
 
@@ -252,7 +217,7 @@ backs off up to the max; a loop that runs cleanly for a while resets its
 backoff."""
 
 HEALTH_PORT = 8080
-"""Default port for the /health endpoint. 200 if all four loops are alive, 503
+"""Default port for the /health endpoint. 200 if all five loops are alive, 503
 otherwise. Overridden at runtime by the ``$PORT`` env var if the host platform
 injects one (Railway, Heroku, etc) — see :func:`health.start_health_server`."""
 

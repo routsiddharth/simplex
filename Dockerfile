@@ -40,9 +40,8 @@ RUN apt-get update \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-# The committed allowlist is baked into the image; the app reads it from cwd.
-COPY simplex_allowlist.yaml ./
-COPY scripts ./scripts
+# The tracked series set is discovered at runtime and persisted in DuckDB on the
+# mounted volume — nothing series-related is baked into the image.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

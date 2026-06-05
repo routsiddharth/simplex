@@ -38,20 +38,20 @@ regular, gap-checked marginal time series the solver will consume.
 
 ## How stage 1 works
 
-One long-running Python process, four supervised async loops sharing a single
+One long-running Python process, five supervised async loops sharing a single
 embedded **DuckDB** file on a mounted volume:
 
 ```
-                 Kalshi REST                     Kalshi WebSocket
-                      │                                  │
-        ┌─────────────▼─────────────┐      ┌─────────────▼──────────────┐
-        │  catalog poller (5 min)   │      │  websocket subscriber      │
-        │  allowlist → open markets │      │  per-market orderbook subs │
-        │  → markets table          │      │  + trade + lifecycle       │
-        │  → active subscription set│─────▶│  → raw_events (append-only)│
-        └───────────────────────────┘      └─────────────┬──────────────┘
-                                                          │
-        ┌──────────────────────────┐       ┌─────────────▼──────────────┐
+      Kalshi REST              Kalshi REST                Kalshi WebSocket
+          │                        │                             │
+  ┌───────▼────────────┐  ┌────────▼──────────────┐  ┌───────────▼────────────┐
+  │ discovery (hourly) │  │ catalog poller (5 min)│  │ websocket subscriber   │
+  │ predicates → admit │  │ tracked_series → open │  │ per-market orderbook   │
+  │ / rank / cap →     │─▶│ markets → active set  │─▶│ subs + trade+lifecycle │
+  │ tracked_series     │  │ → markets table       │  │ → raw_events (append)  │
+  └────────────────────┘  └───────────────────────┘  └───────────┬────────────┘
+                                                                  │
+        ┌──────────────────────────┐       ┌───────────────▼────────────┐
         │  book audit (hourly)      │       │  snapshot builder (10 s)   │
         │  in-memory book vs REST   │◀─────▶│  replays raw_events,        │
         │  → audit_results          │ books │  maintains order books,    │
@@ -60,7 +60,13 @@ embedded **DuckDB** file on a mounted volume:
                                             └────────────────────────────┘
 ```
 
-- **Catalog poller** reads `simplex_allowlist.yaml`, expands each series to its
+- **Discovery loop** sweeps all open Kalshi series hourly and rewrites the
+  `tracked_series` table — admitting a series iff it has a **partition** (a
+  mutually-exclusive event with ≥3 markets) **or** a **hierarchy** (an event with
+  ≥2 distinct markets) **and** clears a volume floor, then ranks and caps the
+  tracked set. No manual allowlist: the system discovers and rotates what it
+  ingests on its own.
+- **Catalog poller** reads the `tracked_series` table, expands each series to its
   open markets via REST, and maintains the active subscription set.
 - **WebSocket subscriber** holds one persistent connection; subscribes
   `orderbook_delta` **one market per subscription** (isolated per-market sequence
@@ -79,12 +85,13 @@ embedded **DuckDB** file on a mounted volume:
 `raw_events` is the source of truth; `snapshots` is a regenerable derived grid.
 A crash in any one loop is restarted by a supervisor without taking the others
 down. SIGTERM flushes, checkpoints, closes the DB, and exits 0. `/health`
-(port 8080) returns 200 only when all four loops are alive.
+(port 8080) returns 200 only when all five loops are alive.
 
 ### Data model (DuckDB — `src/simplex_ingest/schema.sql`)
 
 | Table | Role |
 |-------|------|
+| `tracked_series` | The self-managed set of series to ingest, rewritten each discovery cycle (admit/rank/cap by predicates). Replaces the old YAML allowlist. |
 | `markets` | Catalog; `subscribed` flags the active set. Rows are never deleted. |
 | `raw_events` | Append-only normalized event log (snapshots, deltas, trades, lifecycle) with exchange sequence numbers. Source of truth. |
 | `snapshots` | 10s materialized grid — the marginal time series the solver will read. |
@@ -103,17 +110,23 @@ pip install -e .
 
 cp .env.example .env        # then fill in the four values (see Configuration)
 
-# 1) Discover which series to ingest (writes simplex_allowlist.yaml).
-python -m scripts.discover_series      # review the ranked output, trim, commit
-
-# 2) Run the ingest.
-python -m simplex_ingest               # four loops start; GET :8080/health
+# Run the ingest — the discovery loop self-populates the tracked series set on
+# boot; there is no manual allowlist step.
+python -m simplex_ingest               # five loops start; GET :8080/health
 ```
 
-The discovery script sweeps all open Kalshi events and ranks series by
-*structural density* (partition + hierarchy evidence over headline volume),
-since richly-structured series yield the most coherence constraints. Review its
-output and trim `simplex_allowlist.yaml` to the markets you actually want.
+The discovery loop sweeps all open Kalshi events hourly and admits each series
+that passes structural + tradeability **predicates** — a partition (mutex event
+≥3 markets) or hierarchy (event ≥2 distinct markets), gated by a volume floor —
+then ranks and caps the tracked set, persisting it to the `tracked_series`
+table. To inspect what it would track against the live catalog without writing
+anything, run a one-shot dry run:
+
+```bash
+python -m simplex_ingest.loops.discovery   # prints admitted + rejected series
+```
+
+Run a one-time sanity check with `pip install -e ".[test]" && pytest`.
 
 ---
 
@@ -156,10 +169,10 @@ src/simplex_ingest/
   events.py  orderbook.py    # normalized events  /  in-memory book + depth + canaries
   subscriber.py              # BaseSubscriber (one new file per future exchange)
   runtime.py supervisor.py health.py util.py log.py
+  discovery_predicates.py    # pure admit/rank predicates (no I/O)
   kalshi/    auth.py rest.py subscriber.py
-  loops/     catalog.py websocket.py snapshots.py audit.py
-scripts/discover_series.py   # one-shot series discovery → simplex_allowlist.yaml
-simplex_allowlist.yaml       # the series to ingest (committed)
+  loops/     catalog.py websocket.py snapshots.py audit.py discovery.py
+tests/                       # pytest suite: predicates, DB atomicity, loop
 Dockerfile  entrypoint.sh  railway.json  README-DEPLOY.md
 ```
 
@@ -176,5 +189,11 @@ Adding another exchange later is a new `subscriber.py` implementing
 - **Depth within 3¢** (not top-of-book) is the headline liquidity signal — it
   distinguishes a thick book from a lone stale quote, the dominant false positive
   for any downstream coherence/arbitrage screen.
-- **Stage 1 has no tests yet** — by design, pending one full cycle against real
-  data (which it has now run). Tests come before the solver builds on top.
+- **Predicate-based auto-discovery** replaced the hand-curated YAML allowlist and
+  its weighted-score discovery script: binary admit/reject predicates separate
+  "track this series" from "rank it," and the tracked set rotates itself hourly
+  with no manual input.
+- **Tests** cover the load-bearing new pieces — the pure predicate module
+  (exhaustive boundary + property tests), the transactional `tracked_series`
+  swap, and the discovery loop's behavior (cap, eviction, failure resilience).
+  Run with `pip install -e ".[test]" && pytest`.

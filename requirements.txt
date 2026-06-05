@@ -9,5 +9,4 @@ certifi>=2024.0       # CA bundle for the websockets TLS handshake
 pydantic>=2.7         # settings models
 pydantic-settings>=2.3  # env-var driven config
 python-dotenv>=1.0    # .env loading (incl. multi-line PEM secret)
-PyYAML>=6.0           # simplex_allowlist.yaml
 sortedcontainers>=2.4  # SortedDict order books
