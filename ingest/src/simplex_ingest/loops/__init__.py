@@ -1,1 +1,1 @@
-"""The five async loops: discovery, catalog, websocket, snapshots, audit."""
+"""The six async loops: discovery, catalog, websocket, snapshots, audit, extraction."""

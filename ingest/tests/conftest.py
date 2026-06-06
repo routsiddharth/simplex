@@ -14,6 +14,7 @@ import pytest
 
 from simplex_ingest.db import Database
 from simplex_ingest.discovery_predicates import EventStats, SeriesStats
+from simplex_ingest.llm import LLMError, MarketSemantics, PairClassification
 from simplex_ingest.runtime import Heartbeats
 
 
@@ -132,14 +133,81 @@ def make_fake_rest():
 
 @pytest.fixture
 def make_runtime():
-    """A SimpleNamespace runtime carrying just what the discovery loop touches."""
+    """A SimpleNamespace runtime carrying just what the loops under test touch."""
 
-    def _make(db, rest):
+    def _make(db, rest=None, llm=None):
         return SimpleNamespace(
             db=db,
             rest=rest,
+            llm=llm,
             shutdown=asyncio.Event(),
             heartbeats=Heartbeats(),
+        )
+
+    return _make
+
+
+# -- fake LLM client (for the extraction loop) ------------------------------
+
+_DEFAULT_SEMANTICS = MarketSemantics(
+    underlying_event="event",
+    resolves_yes_when="yes",
+    resolves_no_when="no",
+    resolution_timing="someday",
+    entities=(),
+    dependencies=(),
+)
+_DEFAULT_CLASSIFICATION = PairClassification(
+    relationship_type="unrelated", direction="none", confidence=0.1, rationale="default"
+)
+
+
+class FakeLLMClient:
+    """In-memory stand-in for OpenRouterClient — no network.
+
+    ``semantics`` maps a market *title* -> MarketSemantics (extract_market only
+    gets the text fields, so tests key on title). ``classifications`` maps a
+    canonical ``(a, b)`` market-id pair -> either one PairClassification (used for
+    every model) or a ``{model: PairClassification}`` dict (to drive the
+    independent-verify agreement gate). ``raise_titles`` / ``raise_pairs`` force
+    an LLMError for the log-and-skip paths.
+    """
+
+    def __init__(self, semantics=None, classifications=None,
+                 raise_titles=None, raise_pairs=None):
+        self.semantics = semantics or {}
+        self.classifications = classifications or {}
+        self.raise_titles = set(raise_titles or ())
+        self.raise_pairs = set(raise_pairs or ())
+        self.extract_calls: list[str] = []
+        self.classify_calls: list[tuple] = []
+
+    async def extract_market(self, model, *, title, description, resolution_criteria):
+        self.extract_calls.append(title)
+        if title in self.raise_titles:
+            raise LLMError("forced extract failure")
+        return self.semantics.get(title, _DEFAULT_SEMANTICS)
+
+    async def classify_pair(self, model, *, market_a, market_b):
+        a, b = market_a["market_id"], market_b["market_id"]
+        self.classify_calls.append((a, b, model))
+        if (a, b) in self.raise_pairs:
+            raise LLMError("forced classify failure")
+        spec = self.classifications.get((a, b), _DEFAULT_CLASSIFICATION)
+        if isinstance(spec, dict):
+            return spec[model]
+        return spec
+
+    async def aclose(self):
+        pass
+
+
+@pytest.fixture
+def make_fake_llm():
+    def _make(semantics=None, classifications=None, raise_titles=None, raise_pairs=None):
+        return FakeLLMClient(
+            semantics=semantics, classifications=classifications,
+            raise_titles=raise_titles, raise_pairs=raise_pairs,
         )
 
     return _make

@@ -13,7 +13,7 @@
 
 ## 1. What gets deployed
 
-A **single always-on container**: one Python process running the five-loop ingest
+A **single always-on container**: one Python process running the six-loop ingest
 (see [`ARCHITECTURE.md`](./ARCHITECTURE.md) §2), writing an embedded DuckDB file
 to a **mounted persistent volume**. It is env-driven, logs JSON to stdout, and
 shuts down cleanly on SIGTERM. Target platform: **Railway**. The same image suits
@@ -82,8 +82,9 @@ clean exits too — not wanted today, since a clean exit is an intentional SIGTE
 
 ## 4. Required service variables
 
-Set on the Railway service (**Variables** tab or CLI). These four are the entire
-runtime env surface; everything else is a constant in `constants.py`.
+Set on the Railway service (**Variables** tab or CLI). These five are the entire
+runtime env surface (four required + one optional); everything else is a constant
+in `constants.py`.
 
 | Variable | Value | Notes |
 |---|---|---|
@@ -91,6 +92,7 @@ runtime env surface; everything else is a constant in `constants.py`.
 | `KALSHI_API_SECRET` | RSA private key (PEM) | multi-line — see below |
 | `KALSHI_ENV` | `prod` or `demo` | selects hosts in `config.py` |
 | `SIMPLEX_DATA_DIR` | `/data` | **must** match the volume mount path |
+| `OPENROUTER_API_KEY` | OpenRouter key | **optional** — enables the Stage-3 LLM extraction layer; absent, that loop idles and plain ingest runs unchanged. The only secret beyond Kalshi; model ids/tuning are constants. |
 
 Plus, if your platform doesn't inject it: **`PORT=8080`** — the health server
 binds `$PORT` when present, else falls back to `HEALTH_PORT` (8080). Railway
@@ -171,9 +173,10 @@ railway up --service simplex --detach     # build + deploy current dir
 CLI deploys are **not** git-triggered — independent of pushes. Use this when you
 want explicit control over when a deploy happens.
 
-After either: build → container start → `/health` returns 200 once all five loops
+After either: build → container start → `/health` returns 200 once all six loops
 have a heartbeat (catalog's first REST sweep + discovery's first sweep take a few
-seconds). Public/healthcheck URL: service → **Settings → Networking**.
+seconds; extraction heartbeats immediately, idle or not). Public/healthcheck URL:
+service → **Settings → Networking**.
 
 ### Project coordinates
 - Railway project `simplex` — id `73e893ea-bde1-4547-a9c7-45013d1172c3`
@@ -184,15 +187,16 @@ seconds). Public/healthcheck URL: service → **Settings → Networking**.
 
 ## 8. Health & readiness
 
-`/health` returns `{"healthy": bool, "loops": {...}}`; 200 iff **all five** loops
-(`catalog`, `websocket`, `snapshot`, `audit`, `discovery`) heartbeat within
-`HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s), else 503. The healthcheck has a 300 s
-grace at deploy time.
+`/health` returns `{"healthy": bool, "loops": {...}}`; 200 iff **all six** loops
+(`catalog`, `websocket`, `snapshot`, `audit`, `discovery`, `extraction`)
+heartbeat within `HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s), else 503. The
+healthcheck has a 300 s grace at deploy time. `extraction` reports healthy even
+without `OPENROUTER_API_KEY` (it heartbeats while idle).
 
 ```bash
 curl https://<service-domain>/health
 # {"healthy": true, "loops": {"catalog": true, "websocket": true,
-#  "snapshot": true, "audit": true, "discovery": true}}
+#  "snapshot": true, "audit": true, "discovery": true, "extraction": true}}
 ```
 
 ---
@@ -206,7 +210,12 @@ Watch the logs and confirm, in order — this is the end-to-end cutover signatur
 2. `catalog refreshed` — `series=N active_markets=M` (next catalog tick).
 3. `ws reconciled` — `added=M removed=0` (first convergence) / `ws initial subscribe`.
 4. `snapshots emitted` — `markets=M` within one `SNAPSHOT_INTERVAL`.
-5. `/health` → 200 with all five loops `true`; Railway marks the deploy SUCCESS.
+5. **If `OPENROUTER_API_KEY` is set:** `semantics extracted` (per market), then
+   `edge classified` (per pair), then `extraction cycle complete`
+   — `semantics=… edges=…` (within one `EXTRACTION_INTERVAL`, after the catalog
+   first populates markets). Without the key: `extraction layer disabled (loop
+   idles)` once, and the loop still heartbeats.
+6. `/health` → 200 with all six loops `true`; Railway marks the deploy SUCCESS.
 
 **Rotation (one-time sanity, ≥ 1 h):** after a discovery interval + one catalog
 refresh, expect a fresh `discovery cycle complete` and — if Kalshi's catalog
@@ -236,7 +245,8 @@ railway ssh
 python - <<'PY'
 import duckdb
 c = duckdb.connect('/data/simplex.duckdb', read_only=True)
-for t in ['tracked_series','markets','raw_events','snapshots','book_state','audit_results']:
+for t in ['tracked_series','markets','raw_events','snapshots','book_state',
+          'audit_results','market_semantics','market_edges']:
     print(t, c.execute(f'SELECT count(*) FROM {t}').fetchone()[0])
 PY
 ```
@@ -251,7 +261,12 @@ write/schema errors; or a loop crash-loops (supervisor restarts > 5/min).
 ## 11. Backups
 
 Railway has **no volume snapshot CLI** today. The volume survives
-restarts/redeploys but that is not a backup.
+restarts/redeploys but that is not a backup. Backups matter more now that the DB
+holds the **non-regenerable** Stage-3 tables (`market_semantics`/`market_edges`):
+unlike `snapshots`/`book_state` they can't be rebuilt from `raw_events` (they cost
+model spend + carry human review decisions — see
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.6), so a lost volume loses real work.
+The file copy below captures them along with everything else.
 
 1. **Stop → copy (consistent):** stop the service (SIGTERM checkpoints + closes
    the DB cleanly), `railway ssh`, copy `/data/simplex.duckdb` out
@@ -269,10 +284,11 @@ Proper off-site backup is the planned **R2 export** (Stage 5), shipping
 cd ingest                   # the service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
-cp .env.example .env        # fill the four values (KALSHI_ENV=demo to start)
-python -m simplex_ingest    # five loops; GET :8080/health
-pytest                      # 116 tests
-python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
+cp .env.example .env        # fill the 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
+python -m simplex_ingest    # six loops; GET :8080/health
+pytest                      # 146 tests
+python -m simplex_ingest.loops.discovery     # dry-run: print admitted/rejected series
+python -m simplex_ingest.loops.extraction    # dry-run: extraction work plan (ingest stopped)
 ```
 
 Local uses `SIMPLEX_DATA_DIR=./data` by default (relative to `ingest/`). The one-shot discovery and a
@@ -302,10 +318,11 @@ Plus **managed Postgres** for transactional trade/position state and **object
 storage (R2)** for the historical corpus, **attached per-service** (each service
 mounts only what it needs). The driver for splitting at all is the single-writer
 DuckDB constraint plus the very different risk profile of a money-moving process;
-the **solver starts as a 6th in-process loop inside `ingest/`** (it cannot open
-the live DuckDB from a separate process) and only splits out after the OLTP/OLAP
-storage inflection. Trading timescale (seconds-to-minutes, per the 10 s grid)
-means low-latency co-location is **not** required; Railway stays a fit.
+the **solver starts as the 7th in-process loop inside `ingest/`** (the Stage-3
+extraction loop is the 6th, already shipped; both stay in-process because a
+separate process cannot open the live DuckDB) and only splits out after the
+OLTP/OLAP storage inflection. Trading timescale (seconds-to-minutes, per the 10 s
+grid) means low-latency co-location is **not** required; Railway stays a fit.
 
 **Build-context wrinkle (future).** Once a shared `libs/simplex_core` is
 extracted (deferred to trader-time), any service that depends on it can no longer

@@ -1,8 +1,8 @@
-"""Process entry point: wire the five loops under one supervisor.
+"""Process entry point: wire the six loops under one supervisor.
 
-Owns the shared DuckDB connection, the Kalshi clients, the shared runtime state,
-the /health server, and clean SIGTERM shutdown (cancel loops -> flush DB ->
-checkpoint books -> close DB -> exit 0).
+Owns the shared DuckDB connection, the Kalshi clients, the optional OpenRouter
+client, the shared runtime state, the /health server, and clean SIGTERM shutdown
+(cancel loops -> flush DB -> checkpoint books -> close DB -> exit 0).
 """
 
 from __future__ import annotations
@@ -18,10 +18,12 @@ from .health import start_health_server
 from .kalshi.auth import KalshiSigner
 from .kalshi.rest import KalshiREST
 from .kalshi.subscriber import KalshiSubscriber
+from .llm import OpenRouterClient
 from .log import configure_logging, get_logger
 from .loops.audit import BookAuditLoop
 from .loops.catalog import CatalogPoller
 from .loops.discovery import DiscoveryLoop
+from .loops.extraction import ExtractionLoop
 from .loops.snapshots import SnapshotBuilder
 from .loops.websocket import WebSocketLoop
 from .runtime import BookStore, Heartbeats, Loop
@@ -39,6 +41,7 @@ class Runtime:
     rest: KalshiREST
     audit_rest: KalshiREST
     subscriber: KalshiSubscriber
+    llm: OpenRouterClient | None
     book_store: BookStore
     reset_requests: "asyncio.Queue[str]"
     resubscribe_event: asyncio.Event
@@ -55,6 +58,23 @@ def build_runtime(settings: Settings) -> Runtime:
     audit_rest = KalshiREST(settings.rest_base_url, signer,
                             TokenBucket(C.AUDIT_REST_CALLS_PER_SECOND, C.AUDIT_REST_BURST))
     subscriber = KalshiSubscriber(signer, settings.ws_url)
+    # The extraction layer (Stage 3) is optional: only built when its secret is
+    # present, else the loop soft-fails (idles) and plain ingest runs unchanged.
+    llm = (
+        OpenRouterClient(
+            settings.openrouter_api_key,
+            C.OPENROUTER_BASE_URL,
+            TokenBucket(C.LLM_CALLS_PER_SECOND, C.LLM_BURST),
+            temperature=C.LLM_TEMPERATURE,
+            max_retries=C.LLM_MAX_RETRIES,
+            timeout=C.LLM_REQUEST_TIMEOUT_SECONDS,
+            backoff_min=C.WS_RECONNECT_MIN_SECONDS,
+            backoff_max=C.WS_RECONNECT_MAX_SECONDS,
+            backoff_factor=C.WS_RECONNECT_BACKOFF_FACTOR,
+        )
+        if settings.openrouter_api_key
+        else None
+    )
     return Runtime(
         settings=settings,
         db=db,
@@ -62,6 +82,7 @@ def build_runtime(settings: Settings) -> Runtime:
         rest=rest,
         audit_rest=audit_rest,
         subscriber=subscriber,
+        llm=llm,
         book_store=BookStore(),
         reset_requests=asyncio.Queue(maxsize=C.RESET_REQUEST_QUEUE_MAXSIZE),
         resubscribe_event=asyncio.Event(),
@@ -116,6 +137,7 @@ async def run() -> int:
         builder,
         BookAuditLoop(rt),
         DiscoveryLoop(rt),
+        ExtractionLoop(rt),
     ]
 
     _install_signal_handlers(asyncio.get_running_loop(), rt.shutdown)
@@ -140,6 +162,8 @@ async def run() -> int:
         log.exception("error during shutdown flush/checkpoint")
     await rt.rest.aclose()
     await rt.audit_rest.aclose()
+    if rt.llm is not None:
+        await rt.llm.aclose()
     rt.db.close()
 
     health_server.close()

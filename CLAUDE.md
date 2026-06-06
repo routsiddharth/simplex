@@ -27,10 +27,12 @@ fix it as part of the change.
 ## What this is
 
 **Simplex** — a real-time probabilistic coherence engine for prediction markets
-(Kalshi). **Only Stage 1 (ingest) is built:** one Python process, five supervised
-async loops, embedded DuckDB on a mounted volume. Downstream stages (solver,
-graph/viz, R2 export, LLM-in-the-loop trading) are planned — see
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §1 and §11.
+(Kalshi). **Stages 1–3 are built:** one Python process, six supervised async
+loops, embedded DuckDB on a mounted volume — ingest (Stage 1) plus the LLM
+**extraction layer** (Stage 3: per-market semantics + a pairwise typed
+relationship-edge graph the solver will consume). The **solver** (Stage 4) and
+everything downstream (graph viz, R2 export, LLM-in-the-loop trading) are
+planned — see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §1 and §11.
 
 The repo is a **monorepo**: the ingest service is self-contained under
 [`ingest/`](./ingest/) (its own `Dockerfile`, `pyproject.toml`, `src/`, `tests/`);
@@ -39,11 +41,13 @@ The repo is a **monorepo**: the ingest service is self-contained under
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §10–11. Run dev commands from
 `ingest/`.
 
-The five loops: **discovery** (hourly — self-manages the `tracked_series` set via
+The six loops: **discovery** (hourly — self-manages the `tracked_series` set via
 predicates), **catalog** (5 min — tracked series → active market set),
 **websocket** (persistent — orderbook/trade/lifecycle → `raw_events`),
 **snapshot** (10 s — replays `raw_events` → `snapshots` grid + book checkpoints),
-**audit** (hourly — in-memory book vs REST reconciliation).
+**audit** (hourly — in-memory book vs REST reconciliation), **extraction** (5 min
+— catalog markets → `market_semantics` + trust-tiered `market_edges` via an LLM;
+soft-fails/idles without `OPENROUTER_API_KEY`).
 
 ## Run / test / inspect
 
@@ -51,10 +55,11 @@ predicates), **catalog** (5 min — tracked series → active market set),
 cd ingest                                  # the service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
-cp .env.example .env                       # four values; KALSHI_ENV=demo to start
+cp .env.example .env                       # 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
 python -m simplex_ingest                   # run the ingest; GET :8080/health
-pytest                                     # 116 tests (predicates, DB, loops, orderbook, reconstruct)
+pytest                                     # 146 tests (predicates, candidates, DB, loops, extraction, orderbook, reconstruct)
 python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
+python -m simplex_ingest.loops.extraction  # dry-run: extraction work plan (ingest stopped)
 ```
 
 Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/DEPLOY.md).
@@ -69,8 +74,11 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
    (Postgres for OLTP) — see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §11.
 3. **Discovery owns the tracked set** — no manual allowlist; predicates rule;
    never wipe the working set on a transient empty sweep or REST error.
-4. **Behavior is configured in `constants.py`, not env.** Only four secrets/
-   deploy values come from `.env` (`config.py`). Don't add env knobs.
+4. **Behavior is configured in `constants.py`, not env.** Five values come from
+   `.env` (`config.py`): the four Kalshi/deploy values + the optional secret
+   `OPENROUTER_API_KEY` (the one allowed exception — a secret can't be a constant;
+   it enables Stage 3). Everything else, incl. LLM model ids / thresholds, is a
+   constant. Don't add env knobs.
 5. **No secrets in the image** (`ingest/.dockerignore` excludes `.env`/`*.pem`).
 6. **Subscribers must not raise on malformed input** — log and drop.
 7. **DuckDB `TIMESTAMP` is naive UTC** — normalize with `util.naive_utc`.

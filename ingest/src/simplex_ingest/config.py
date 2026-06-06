@@ -1,7 +1,12 @@
-"""Environment-driven configuration (the four-value surface).
+"""Environment-driven configuration (the five-value surface).
 
 Only secrets and deployment-specific values come from the environment / .env.
 Everything tunable lives in :mod:`simplex_ingest.constants`.
+
+The four ingest values are required; ``OPENROUTER_API_KEY`` is the fifth, and the
+one *optional* one — it is a secret (so it can't be a constant) that unlocks the
+Stage-3 extraction layer. Absent it, the extraction loop soft-fails (idles) and
+plain ingest runs unchanged.
 """
 
 from __future__ import annotations
@@ -70,7 +75,7 @@ def normalize_pem(raw: str) -> str:
 
 
 class Settings(BaseSettings):
-    """The four environment inputs, plus derived helpers."""
+    """The five environment inputs, plus derived helpers."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -83,6 +88,8 @@ class Settings(BaseSettings):
     kalshi_api_secret: str = Field(..., alias="KALSHI_API_SECRET")
     kalshi_env: str = Field("demo", alias="KALSHI_ENV")
     simplex_data_dir: Path = Field(Path("./data"), alias="SIMPLEX_DATA_DIR")
+    # Optional: enables the Stage-3 extraction layer. Empty => loop idles.
+    openrouter_api_key: str = Field("", alias="OPENROUTER_API_KEY")
 
     # -- derived ------------------------------------------------------------
 

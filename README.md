@@ -18,28 +18,32 @@ latent arbitrage.
 
 ## Status
 
-Simplex is being built in stages. **Stage 1 (ingest) is complete and running;**
-the coherence engine itself is the next stage.
+Simplex is being built in stages. **Stages 1–3 are complete and running;** the
+solver is the next stage.
 
 | Stage | Scope | State |
 |------|-------|-------|
 | **1. Ingest** | Live Kalshi order books → normalized event log → 10s snapshot grid, with catalog discovery, book reconstruction, checkpointing, and a hourly REST reconciliation audit. | **Built** |
 | 2. Deploy | Containerized, runs 24/7 on a mounted volume (Railway / Fly.io). | **Built** (`ingest/Dockerfile`, `ingest/railway.json`, [`docs/DEPLOY.md`](./docs/DEPLOY.md)) |
-| 3. Solver | Max-entropy joint distribution over related markets given snapshot marginals + structural constraints (partitions, hierarchy, mutual exclusivity); coherence/deviation scoring. | Planned |
-| 4. Graph + viz | Relationship graph across markets; surface the largest incoherences over time. | Planned |
-| 5. Export | Continuous R2 export of `snapshots` / `raw_events` for offline analysis & backup. | Planned |
+| **3. Extraction** | LLM layer over the catalog: per-market semantic representations + pairwise **typed relationship edges** (the market graph), trust-tiered (hard / soft / manual-review) for the solver. | **Built** |
+| 4. Solver | Max-entropy joint distribution over related markets given snapshot marginals + the Stage-3 **edge constraints**; coherence/deviation scoring. | Planned |
+| 5. Graph viz | Surface the largest incoherences over the edge graph and over time. | Planned |
+| 6. Export | Continuous R2 export of `snapshots` / `raw_events` (+ the durable extraction tables) for offline analysis & backup. | Planned |
 | — | Other exchanges (Polymarket, Manifold) via the `BaseSubscriber` seam. | Planned |
 
-Everything downstream of the `snapshots` table (stages 3–4) is the coherence
-engine proper and is not built yet. Stage 1 exists to produce the clean,
-regular, gap-checked marginal time series the solver will consume.
+The solver and everything downstream of it are not built yet. Stage 1 produces
+the clean, regular, gap-checked marginal time series the solver will consume;
+Stage 3 produces the **structural** half — the typed relationship edges it will
+combine with those marginals (and these LLM-derived tables, unlike the snapshot
+grid, are **not** regenerable from `raw_events`).
 
 ---
 
-## How stage 1 works
+## How it works
 
-One long-running Python process, five supervised async loops sharing a single
-embedded **DuckDB** file on a mounted volume:
+One long-running Python process, six supervised async loops sharing a single
+embedded **DuckDB** file on a mounted volume (the ingest's five, plus the Stage-3
+extraction loop):
 
 ```
       Kalshi REST              Kalshi REST                Kalshi WebSocket
@@ -81,11 +85,22 @@ embedded **DuckDB** file on a mounted volume:
 - **Book audit** (hourly, within a configurable UTC window) reconciles each
   in-memory book against a fresh REST orderbook and forces a reset on large
   divergence.
+- **Extraction loop** (every 5 min, Stage 3) turns each active market's
+  description into a structured semantic record (`market_semantics`, cached
+  forever), then classifies cheaply-picked candidate pairs into typed
+  relationship edges (`market_edges`) — `same_event`, `implies`,
+  `mutually_exclusive`, `partition_member`, `conditional`, `correlated`,
+  `unrelated`. Edges enter at a **trust tier** matched to confidence: `trusted`
+  (the solver's hard constraints, promoted only when an independent second model
+  agrees), `soft`, or `review` (a manual-review queue). Needs an OpenRouter key;
+  without one it idles and plain ingest runs unchanged.
 
 `raw_events` is the source of truth; `snapshots` is a regenerable derived grid.
-A crash in any one loop is restarted by a supervisor without taking the others
-down. SIGTERM flushes, checkpoints, closes the DB, and exits 0. `/health`
-(port 8080) returns 200 only when all five loops are alive.
+The Stage-3 `market_semantics`/`market_edges` are a third class — LLM-derived,
+durable, and **not** regenerable from `raw_events`. A crash in any one loop is
+restarted by a supervisor without taking the others down. SIGTERM flushes,
+checkpoints, closes the DB, and exits 0. `/health` (port 8080) returns 200 only
+when all six loops are alive.
 
 ### Data model (DuckDB — `ingest/src/simplex_ingest/schema.sql`)
 
@@ -97,6 +112,8 @@ down. SIGTERM flushes, checkpoints, closes the DB, and exits 0. `/health`
 | `snapshots` | 10s materialized grid — the marginal time series the solver will read. |
 | `book_state` | Serialized in-memory books for fast restart. |
 | `audit_results` | Per-market book-vs-REST reconciliation outcomes. |
+| `market_semantics` | Stage-3 per-market semantic cache (LLM-derived; non-regenerable). |
+| `market_edges` | Stage-3 pairwise typed relationship graph, trust-tiered for the solver (LLM-derived; non-regenerable). |
 
 ---
 
@@ -109,11 +126,11 @@ cd ingest                   # the ingest service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e .
 
-cp .env.example .env        # then fill in the four values (see Configuration)
+cp .env.example .env        # fill the 4 Kalshi values (see Configuration); OPENROUTER_API_KEY optional
 
 # Run the ingest — the discovery loop self-populates the tracked series set on
 # boot; there is no manual allowlist step.
-python -m simplex_ingest               # five loops start; GET :8080/health
+python -m simplex_ingest               # six loops start; GET :8080/health
 ```
 
 The discovery loop sweeps all open Kalshi events hourly and admits each series
@@ -135,7 +152,7 @@ Run a one-time sanity check with `pip install -e ".[test]" && pytest`.
 
 Two homes, deliberately separated:
 
-**`.env` — secrets & deployment only (four values):**
+**`.env` — secrets & deployment only (five values: four required + one optional):**
 
 | Variable | Meaning |
 |---|---|
@@ -143,10 +160,12 @@ Two homes, deliberately separated:
 | `KALSHI_API_SECRET` | RSA private key (PEM); inline value or a path — the loader normalizes either |
 | `KALSHI_ENV` | `prod` or `demo` |
 | `SIMPLEX_DATA_DIR` | where the DuckDB file lives (`./data` local, `/data` in prod) |
+| `OPENROUTER_API_KEY` | **optional** — enables the Stage-3 LLM extraction layer; absent, that loop idles |
 
 **`ingest/src/simplex_ingest/constants.py` — every tuning knob** (intervals, depth band,
-audit window/thresholds, rate limits, reconnect bounds, health port, log level),
-each documented inline. No environment lookups; edit and redeploy to tune.
+audit window/thresholds, rate limits, reconnect bounds, **LLM model ids /
+confidence cutoffs**, health port, log level), each documented inline. No
+environment lookups; edit and redeploy to tune.
 
 ---
 

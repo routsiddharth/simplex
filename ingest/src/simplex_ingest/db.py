@@ -98,6 +98,45 @@ ON CONFLICT (series_ticker) DO UPDATE SET
     rank_position = EXCLUDED.rank_position
 """  # NB: admitted_at deliberately untouched on conflict (preserved from first admit).
 
+_SEMANTICS_UPSERT = """
+INSERT INTO market_semantics (market_id, platform, underlying_event, resolves_yes_when,
+    resolves_no_when, resolution_timing, entities, dependencies, model,
+    extraction_version, extracted_at, raw_response)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market_id) DO UPDATE SET
+    platform = EXCLUDED.platform,
+    underlying_event = EXCLUDED.underlying_event,
+    resolves_yes_when = EXCLUDED.resolves_yes_when,
+    resolves_no_when = EXCLUDED.resolves_no_when,
+    resolution_timing = EXCLUDED.resolution_timing,
+    entities = EXCLUDED.entities,
+    dependencies = EXCLUDED.dependencies,
+    model = EXCLUDED.model,
+    extraction_version = EXCLUDED.extraction_version,
+    extracted_at = EXCLUDED.extracted_at,
+    raw_response = EXCLUDED.raw_response
+"""
+
+_EDGE_UPSERT = """
+INSERT INTO market_edges (platform, market_id_a, market_id_b, relationship_type,
+    direction, confidence, trust_tier, agreement_status, rationale, model,
+    verify_model, extraction_version, classified_at, raw_response)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (platform, market_id_a, market_id_b) DO UPDATE SET
+    relationship_type = EXCLUDED.relationship_type,
+    direction = EXCLUDED.direction,
+    confidence = EXCLUDED.confidence,
+    trust_tier = EXCLUDED.trust_tier,
+    agreement_status = EXCLUDED.agreement_status,
+    rationale = EXCLUDED.rationale,
+    model = EXCLUDED.model,
+    verify_model = EXCLUDED.verify_model,
+    extraction_version = EXCLUDED.extraction_version,
+    classified_at = EXCLUDED.classified_at,
+    raw_response = EXCLUDED.raw_response
+"""  # NB: review_status/reviewed_* deliberately untouched — a re-classification
+     # must not silently clobber a human review decision on the same pair.
+
 
 class Database:
     def __init__(self, path: Path) -> None:
@@ -267,6 +306,134 @@ class Database:
         norm = [(naive_utc(r[0]), *r[1:]) for r in rows]
         with self._lock:
             self._con.executemany(_AUDIT_INSERT, norm)
+
+    # -- extraction layer (market_semantics / market_edges) ----------------
+
+    def upsert_market_semantics(self, rows: list[tuple[Any, ...]]) -> None:
+        """Idempotent upsert of per-market semantic records.
+
+        Each row is ``(market_id, platform, underlying_event, resolves_yes_when,
+        resolves_no_when, resolution_timing, entities, dependencies, model,
+        extraction_version, extracted_at, raw_response)``; entities/dependencies/
+        raw_response are JSON strings, extracted_at a datetime."""
+        if not rows:
+            return
+        norm = [(*r[:10], naive_utc(r[10]) if r[10] else None, r[11]) for r in rows]
+        with self._lock:
+            self._con.executemany(_SEMANTICS_UPSERT, norm)
+
+    def get_markets_missing_semantics(self, version: int) -> list[dict[str, Any]]:
+        """Active (subscribed) markets with no current-version semantics row.
+
+        Returns the text fields the extractor needs. A market whose semantics were
+        written at an older ``extraction_version`` is re-listed (the prompt/schema
+        moved on); same-version rows are skipped (cached forever otherwise)."""
+        with self._lock:
+            rows = self._con.execute(
+                """
+                SELECT m.market_id, m.title, m.description, m.resolution_criteria
+                FROM markets m
+                LEFT JOIN market_semantics s ON s.market_id = m.market_id
+                WHERE m.subscribed = TRUE
+                  AND (s.market_id IS NULL OR s.extraction_version IS DISTINCT FROM ?)
+                """,
+                [version],
+            ).fetchall()
+        return [
+            {"market_id": r[0], "title": r[1], "description": r[2], "resolution_criteria": r[3]}
+            for r in rows
+        ]
+
+    def get_active_markets_with_semantics(self) -> list[dict[str, Any]]:
+        """Active markets that already have a semantics row, joined with the
+        hierarchy keys + entities the pair stage needs (candidate gen + prompt)."""
+        with self._lock:
+            rows = self._con.execute(
+                """
+                SELECT m.market_id, m.title, m.series_ticker, m.event_ticker,
+                       s.underlying_event, s.resolves_yes_when, s.resolves_no_when,
+                       s.resolution_timing, s.entities, s.dependencies
+                FROM markets m
+                JOIN market_semantics s ON s.market_id = m.market_id
+                WHERE m.subscribed = TRUE
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "market_id": r[0],
+                    "title": r[1],
+                    "series_ticker": r[2],
+                    "event_ticker": r[3],
+                    "underlying_event": r[4],
+                    "resolves_yes_when": r[5],
+                    "resolves_no_when": r[6],
+                    "resolution_timing": r[7],
+                    "entities": json.loads(r[8]) if r[8] else [],
+                    "dependencies": json.loads(r[9]) if r[9] else [],
+                }
+            )
+        return out
+
+    def get_classified_pairs(self, version: int) -> set[tuple[str, str]]:
+        """Canonical (a, b) pairs already classified at ``version`` — skip these."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT market_id_a, market_id_b FROM market_edges WHERE extraction_version = ?",
+                [version],
+            ).fetchall()
+        return {(r[0], r[1]) for r in rows}
+
+    def upsert_edges(self, rows: list[tuple[Any, ...]]) -> None:
+        """Idempotent upsert of typed edges, keyed on the canonical pair.
+
+        Each row is ``(platform, market_id_a, market_id_b, relationship_type,
+        direction, confidence, trust_tier, agreement_status, rationale, model,
+        verify_model, extraction_version, classified_at, raw_response)`` with
+        ``market_id_a < market_id_b``. Human review columns are never touched."""
+        if not rows:
+            return
+        norm = [(*r[:12], naive_utc(r[12]) if r[12] else None, r[13]) for r in rows]
+        with self._lock:
+            self._con.executemany(_EDGE_UPSERT, norm)
+
+    _EDGE_COLS = (
+        "platform, market_id_a, market_id_b, relationship_type, direction, "
+        "confidence, trust_tier, agreement_status, rationale, model, verify_model, "
+        "extraction_version, classified_at, review_status"
+    )
+
+    def _edge_dicts(self, rows: list[tuple]) -> list[dict[str, Any]]:
+        keys = [c.strip() for c in self._EDGE_COLS.split(",")]
+        return [dict(zip(keys, r)) for r in rows]
+
+    def get_edges_for_pairs(self, pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], dict[str, Any]]:
+        """Edge rows for the given canonical (a, b) pairs, keyed by the pair."""
+        pl = list(pairs)
+        if not pl:
+            return {}
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        with self._lock:
+            for a, b in pl:
+                row = self._con.execute(
+                    f"SELECT {self._EDGE_COLS} FROM market_edges "
+                    "WHERE market_id_a = ? AND market_id_b = ?",
+                    [a, b],
+                ).fetchone()
+                if row is not None:
+                    out[(a, b)] = self._edge_dicts([row])[0]
+        return out
+
+    def pending_review_edges(self) -> list[dict[str, Any]]:
+        """The manual-review queue: review-tier edges still awaiting a decision."""
+        with self._lock:
+            rows = self._con.execute(
+                f"SELECT {self._EDGE_COLS} FROM market_edges "
+                "WHERE trust_tier = 'review' AND review_status = 'pending' "
+                "ORDER BY confidence DESC"
+            ).fetchall()
+        return self._edge_dicts(rows)
 
     # -- snapshot-builder queries ------------------------------------------
 

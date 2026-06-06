@@ -20,33 +20,44 @@ joint distribution** consistent with the quoted marginals, and rank where the
 quotes diverge most from that maximally-noncommittal joint. Those divergences are
 the incoherences: mispriced relationships, stale legs, latent arbitrage.
 
-It is built in stages. **Only Stage 1 (ingest) exists today.**
+It is built in stages. **Stages 1–3 (ingest, deploy, the LLM extraction layer)
+exist today.**
 
 | Stage | Scope | State |
 |------|-------|-------|
 | 1. Ingest | Live Kalshi books → normalized event log → 10s snapshot grid, with self-managing catalog discovery, book reconstruction, checkpointing, and an hourly REST reconciliation audit. | **Built** |
 | 2. Deploy | Containerized, 24/7 on a mounted volume (Railway). | **Built** — see [`DEPLOY.md`](./DEPLOY.md) |
-| 3. Solver | Max-entropy joint over related markets given snapshot marginals + structural constraints; coherence/deviation scoring. | Planned |
-| 4. Graph + viz | Relationship graph across markets; surface largest incoherences over time. | Planned |
-| 5. Export | Continuous R2 export of `snapshots` / `raw_events`. | Planned |
+| 3. Extraction | LLM layer over the catalog: per-market semantic representations + pairwise **typed relationship edges** (the market graph), trust-tiered (hard / soft / manual-review) for the solver. | **Built** — see §3 (Extraction), §5 |
+| 4. Solver | Max-entropy joint over related markets given snapshot marginals + the Stage-3 **edge constraints**; coherence/deviation scoring. | Planned |
+| 5. Graph viz | Surface the largest incoherences over the edge graph and over time. | Planned |
+| 6. Export | Continuous R2 export of `snapshots` / `raw_events` (and the durable extraction tables). | Planned |
 | — | LLM-in-the-loop autonomous trading + trade datastore. | Planned — see §11 |
 | — | Other venues (Polymarket, Manifold) via the `BaseSubscriber` seam. | Planned |
 
-Everything downstream of the `snapshots` table is the coherence engine proper
-and is **not built**. Stage 1 exists to produce the regular, per-market
-gap-checked marginal time series the solver will consume — a 10 s grid that is
-contiguous while the process runs but **may have gaps across restarts** (the
-grid is forward-only; see §3), all fully regenerable from `raw_events`.
+**Why extraction precedes the solver.** The solver computes the joint *given the
+relationships between markets* — those typed edges are its structural input, so
+the edge graph is a prerequisite, not a follow-on. Stage 3 builds it.
+
+What remains **unbuilt** is the solver itself and everything downstream of it.
+Stage 1 produces the regular, per-market gap-checked marginal time series the
+solver will consume — a 10 s grid, contiguous while the process runs but with
+possible **gaps across restarts** (the grid is forward-only; see §3), all fully
+regenerable from `raw_events`. Stage 3 produces the *structural* half — the
+relationship edges the solver combines with those marginals. Unlike the grid, the
+extraction outputs are **not** regenerable from `raw_events` (see §5, §9).
 
 ---
 
 ## 2. Process model
 
-One long-running Python process. Inside it, **five supervised async loops** share
+One long-running Python process. Inside it, **six supervised async loops** share
 a single embedded **DuckDB** file on a mounted volume. Everything runs on one
 asyncio event loop; the only work dispatched to threads is DuckDB I/O (via
 `asyncio.to_thread`), and every DB statement is serialized behind a single write
-lock — because **DuckDB is single-writer** (see §9).
+lock — because **DuckDB is single-writer** (see §9). The sixth loop (extraction)
+is in-process for exactly this reason: a separate process **cannot open the live
+DuckDB at all** while ingest holds the lock — the same constraint that keeps the
+future solver in-process (see §11).
 
 ```
       Kalshi REST              Kalshi REST                Kalshi WebSocket
@@ -65,15 +76,27 @@ lock — because **DuckDB is single-writer** (see §9).
         │  large diff → book reset  │       │  emits snapshots (LOCF),   │
         └──────────────────────────┘       │  checkpoints book_state     │
                                             └────────────────────────────┘
+
+   OpenRouter (LLM)          markets catalog
+        │                         │
+  ┌─────▼─────────────────────────▼──────────┐
+  │ extraction (5 min)                        │
+  │ A: market → market_semantics (cached)     │
+  │ B: candidate pairs → classify → trust tier│
+  │    → market_edges (trusted/soft/review)   │
+  └───────────────────────────────────────────┘
 ```
 
 A `supervisor` runs each loop's `run()` forever; a crash is logged and the loop
 restarted with jittered backoff (reset after a sustained healthy run) without
 taking the others down. SIGTERM/SIGINT triggers a clean shutdown: cancel loops →
-flush buffered `raw_events` → checkpoint books → close DB → exit 0.
+flush buffered `raw_events` → checkpoint books → close DB + REST/LLM clients →
+exit 0.
 
-`/health` (port `$PORT`, default 8080) returns 200 **only** when all five loops
-have emitted a heartbeat within `HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s).
+`/health` (port `$PORT`, default 8080) returns 200 **only** when all six loops
+have emitted a heartbeat within `HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s). The
+extraction loop heartbeats even when idle (no `OPENROUTER_API_KEY`), so a
+key-less deploy stays healthy.
 
 Code map: entry `app.py` (`run()` wires runtime, loops, signals, health,
 shutdown) / `__main__.py`. Shared state in `runtime.py` (`BookStore` of
@@ -84,7 +107,7 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 
 ---
 
-## 3. The five loops
+## 3. The six loops
 
 ### Discovery (`loops/discovery.py`) — the self-managing tracked set
 - **Cadence:** eager run on boot, then every `DISCOVERY_INTERVAL_SECONDS` (1 h).
@@ -172,6 +195,53 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   but catches a *magnitude* bug (e.g. a fixed-point/decode error that yields the
   right levels at wrong sizes) that the structural test alone cannot see.
 
+### Extraction (`loops/extraction.py`) — the LLM semantic + edge layer (Stage 3)
+- **Cadence:** every `EXTRACTION_INTERVAL_SECONDS` (5 min). Both phases are
+  idempotent no-ops when there's no new work, so the cadence costs nothing on a
+  quiet catalog. Bounded per cycle by `EXTRACTION_BATCH_SIZE` (50); a backlog
+  drains across cycles.
+- **Reasoning belongs at pair time, not extraction time.** Phase A makes each
+  market *rich* (a comparison-ready semantic record); Phase B does the logical
+  comparison **by model**, not by code — comparison-by-code is brittle across a
+  domain this varied. The relationship taxonomy and prompts live in `llm/`.
+- **Phase A — per-market semantics.** Active markets with no current-version
+  `market_semantics` row are sent to `EXTRACTION_MODEL` (a Sonnet tier — cheap,
+  high-volume) one at a time. The model returns the underlying event, the YES/NO
+  resolution conditions, resolution timing, and the real-world entities /
+  dependencies the market hinges on. Cached on `market_id` and **never
+  re-extracted** unless `EXTRACTION_PROMPT_VERSION` bumps (descriptions don't
+  change after listing).
+- **Phase B — pairwise typed edges.** Candidate pairs are picked **cheaply** by
+  `pair_candidates.py` (a pure module: same `event_ticker` OR same
+  `series_ticker` OR ≥ `PAIR_ENTITY_OVERLAP_MIN` shared entities) so Stage B never
+  classifies all O(n²) pairs. Each candidate goes to `PAIR_MODEL` (an Opus tier —
+  the hard reasoning, low volume), which returns one of seven relationship types
+  — `same_event`, `implies`, `mutually_exclusive`, `partition_member`,
+  `conditional`, `correlated`, `unrelated` — a direction (for the asymmetric
+  ones), a confidence, and a rationale. An unknown label is rejected (`LLMError`),
+  never coerced into the graph.
+- **Trust gradient (why a bad edge is dangerous).** A wrong edge fed to the
+  convex solver becomes a confident-looking but spurious "arbitrage," so edges
+  enter at a tier matched to confidence:
+  - `confidence ≥ EDGE_TRUSTED_CONFIDENCE` (0.85) → **candidate** for `trusted`
+    (the solver's hard constraints), promoted **only if** an *independent* second
+    model (`PAIR_VERIFY_MODEL`, deliberately different from `PAIR_MODEL`) agrees
+    on the relationship type. Agreement → `trusted` (`agreement_status='agreed'`);
+    disagreement → `review`. The 2× spend lands only on this highest-blast-radius
+    band.
+  - `≥ EDGE_SOFT_CONFIDENCE` (0.6) → `soft` (a soft solver constraint).
+  - below that → `review` (the manual-review queue: the query
+    `trust_tier='review' AND review_status='pending'`).
+- **Outputs are durable, non-regenerable artifacts** (§5, §9) — never wiped on
+  re-run; a re-classification updates the edge but **never** clobbers a human
+  review decision (`review_status`/`reviewed_*` are left untouched on conflict).
+- **Soft-fails without a key.** No `OPENROUTER_API_KEY` → `rt.llm is None` → the
+  cycle is a logged no-op and plain ingest runs unchanged. **One bad item never
+  sinks a pass:** the client raises `LLMError` on any transport/parse/schema
+  failure and the loop logs-and-skips that single market or pair.
+- Dry-run inspector (DB read-only, no model calls, no spend; ingest must be
+  stopped): `python -m simplex_ingest.loops.extraction`.
+
 ---
 
 ## 4. Discovery predicates (`discovery_predicates.py`)
@@ -217,6 +287,16 @@ lock; `raw_events` writes are buffered and flushed in batches.
 | `snapshots` | 10 s materialized grid — the marginal time series the solver reads. | Regenerable from `raw_events`. PK `(ts, platform, market_id)` gives idempotency under window re-runs. |
 | `book_state` | Serialized in-memory books for fast restart. | A replay accelerator, not a source of truth. |
 | `audit_results` | Per-market book-vs-REST reconciliation outcomes. | `no_diff`/`small_diff`/`large_diff`/`error`; `action_taken` none/`book_reset`. |
+| `market_semantics` | **Stage-3 per-market semantic cache (LLM-derived).** | PK `market_id`. Cached forever; re-extracted only when `extraction_version` bumps. `entities`/`dependencies` are JSON arrays. **Non-regenerable** (see below). |
+| `market_edges` | **Stage-3 pairwise typed relationship graph (LLM-derived).** | PK `(platform, market_id_a, market_id_b)`, canonical `a < b`. `trust_tier` ∈ `trusted`/`soft`/`review`; `agreement_status`; review-queue columns. The review queue is the query `trust_tier='review' AND review_status='pending'` — no separate table. **Non-regenerable** (see below). |
+
+**Two source-of-truth classes.** `snapshots` and `book_state` are *derived* —
+fully regenerable from `raw_events`, safe to drop and rebuild. The Stage-3
+tables are **not**: they are LLM-derived (costly, non-deterministic, and —
+review decisions — partly human-curated), so they cannot be reconstructed from
+`raw_events`. They get **`raw_events`-grade durability**: append/upsert only,
+never casually wiped, and included in backup/export (§9, §11). "Cached forever"
+in `market_semantics` is a durability requirement, not just an optimization.
 
 **Timestamps:** DuckDB `TIMESTAMP` is naive; all writes normalize to naive UTC
 (`util.naive_utc`). Aware UTC is used in memory.
@@ -281,15 +361,23 @@ venue-neutral (`platform` tag on every row).
 
 ## 8. Cross-cutting concerns
 
-- **Configuration split.** Only **four** values come from the environment/`.env`
-  (`KALSHI_API_KEY_ID`, `KALSHI_API_SECRET`, `KALSHI_ENV`, `SIMPLEX_DATA_DIR`;
-  see `config.py`, `ingest/.env.example`). **Everything tunable** (intervals, depth
-  band, audit thresholds, rate limits, ports, reconnect bounds, predicate
-  thresholds, log level) is a documented constant in `constants.py`. No env
-  lookups for behavior — edit a constant and redeploy.
+- **Configuration split.** **Five** values come from the environment/`.env` —
+  four required (`KALSHI_API_KEY_ID`, `KALSHI_API_SECRET`, `KALSHI_ENV`,
+  `SIMPLEX_DATA_DIR`) plus one optional, **`OPENROUTER_API_KEY`** (see `config.py`,
+  `ingest/.env.example`). The LLM key joins the env surface because it is a
+  *secret* (it can't be a constant); it's the one bounded exception to "four
+  values," and the precedent the future trader's exchange-write secret reuses
+  (§11). **Everything else tunable** (intervals, depth band, audit thresholds,
+  rate limits, ports, reconnect bounds, predicate thresholds, **LLM model ids /
+  confidence cutoffs / entity-overlap threshold**, log level) stays a documented
+  constant in `constants.py`. No env lookups for behavior — edit a constant and
+  redeploy.
 - **Rate limiting (`util.TokenBucket`).** General catalog/discovery REST:
   `REST_CALLS_PER_SECOND`/`REST_BURST` (8/8). Audit has its **own** bucket
-  (`AUDIT_REST_*`, 4/4) so an audit pass can't starve the pollers.
+  (`AUDIT_REST_*`, 4/4) so an audit pass can't starve the pollers. The extraction
+  loop's OpenRouter client has its **own** bucket too
+  (`LLM_CALLS_PER_SECOND`/`LLM_BURST`, 2/4) — model spend, not REST budget, is its
+  real constraint.
 - **Supervision & restart (`supervisor.py`).** Per-loop jittered backoff bounded
   by `SUPERVISOR_RESTART_*`; backoff resets after a 60 s healthy run.
 - **Liveness (`runtime.Heartbeats`, `health.py`).** Loops idle through the shared
@@ -298,7 +386,7 @@ venue-neutral (`platform` tag on every row).
 - **Logging (`log.py`).** Structured JSON to stdout, one object per line, tagged
   with `loop` and contextual `extra` fields. Level via `LOG_LEVEL`.
 - **Shutdown.** SIGTERM/SIGINT → cancel supervisor + the discovery-grace task →
-  flush `raw_events` → checkpoint books → close REST clients + DB → exit 0.
+  flush `raw_events` → checkpoint books → close REST + LLM clients + DB → exit 0.
 
 ---
 
@@ -315,9 +403,18 @@ venue-neutral (`platform` tag on every row).
 3. **Discovery owns the tracked set.** No manual allowlist, pins, or bans;
    predicates rule. Discovery never wipes the working set on a transient empty
    sweep or REST error.
-4. **Writes are idempotent / safe to re-run.** `markets`/`snapshots`/`book_state`
-   upsert on their PKs; `tracked_series` is swapped in a transaction.
-5. **Subscribers must not raise on malformed input** — log and drop.
+4. **Writes are idempotent / safe to re-run.** `markets`/`snapshots`/`book_state`/
+   `market_semantics`/`market_edges` upsert on their PKs; `tracked_series` is
+   swapped in a transaction. An edge re-classification updates the edge but
+   **never** touches its human-review columns (`review_status`/`reviewed_*`).
+5. **Malformed external input must not raise into a loop** — log and drop/skip.
+   The WS subscribers drop a bad message; the extraction LLM client raises a
+   typed `LLMError` and the loop logs-and-skips that one market/pair.
+6. **The Stage-3 extraction outputs are durable and non-regenerable.**
+   `market_semantics` and `market_edges` are LLM-derived (and partly
+   human-curated) — unlike `snapshots`/`book_state` they cannot be rebuilt from
+   `raw_events`, so they are never wiped on a transient error and must be covered
+   by backup/export (§5, §11).
 
 ---
 
@@ -338,11 +435,13 @@ ingest/                      # the ingest service — self-contained, deployable
     events.py  orderbook.py  # NormalizedEvent  /  in-memory book + depth + canaries
     reconstruct.py           # BookReconstructor: per-market replay state machine
     discovery_predicates.py  # pure admit/rank predicates (no I/O)
+    pair_candidates.py       # pure Stage-B candidate-pair generation (no I/O)
     subscriber.py            # BaseSubscriber (one new file per future venue)
     runtime.py supervisor.py health.py util.py log.py
     kalshi/  auth.py rest.py subscriber.py fixedpoint.py   # fixedpoint: fp/dollars decoding
-    loops/   discovery.py catalog.py websocket.py snapshots.py audit.py
-  tests/                     # pytest+hypothesis: predicates, DB atomicity, loops
+    llm/     __init__.py client.py   # OpenRouter client: extract_market / classify_pair + taxonomy
+    loops/   discovery.py catalog.py websocket.py snapshots.py audit.py extraction.py
+  tests/                     # pytest+hypothesis: predicates, DB atomicity, loops, extraction
 docs/      ARCHITECTURE.md DEPLOY.md   # repo-level (shared across services)
 CLAUDE.md  README.md
 # future siblings (not yet created): trader/  viz/  libs/simplex_core/
@@ -359,17 +458,21 @@ The current single-process design is correct for read-only ingest. Two future
 additions reshape it; capture the reasoning here so we build toward it
 deliberately.
 
-### Stage 3 — the solver
-Reads the `snapshots` marginal grid and structural relationships, computes the
-max-entropy joint and coherence/deviation scores. It **must begin as a 6th loop
-in-process** — not because in-process is merely simpler, but because the
+### Stage 4 — the solver
+Reads the `snapshots` marginal grid **and the Stage-3 `market_edges`** (the
+trust-tiered structural relationships — `trusted` edges as hard constraints,
+`soft` edges softly), computes the max-entropy joint and coherence/deviation
+scores. It **must begin as the 7th in-process loop** (the extraction loop is the
+6th, shipped) — not because in-process is merely simpler, but because the
 single-writer DuckDB lock (§9.2) means a *separate* solver process **cannot open
 `simplex.duckdb` at all** while ingest holds it (read-only opens fail too). So a
 standalone solver service is not an option until the storage inflection below
 gives it an independent place to read from. In-process the solver only reads what
 this process already writes, with no DB-sharing problem; it splits out **after**
-the OLTP/OLAP split (e.g. reading snapshots from R2/Parquet or a replica), not
-before.
+the OLTP/OLAP split (e.g. reading snapshots + edges from R2/Parquet or a
+replica), not before. Stage 3 already proved this pattern in-process and
+established the external-model-secret precedent (`OPENROUTER_API_KEY`) the trader
+reuses.
 
 ### LLM-in-the-loop autonomous trading
 This is the highest-risk addition and should be a **separate process/service**
@@ -395,9 +498,12 @@ DuckDB while ingest is writing. When a second writer appears:
 
 - **OLTP — orders, positions, decisions:** needs ACID + concurrent access + to be
   the operational source of truth → **Postgres** (Railway-managed).
-- **OLAP — market data, snapshots, raw_events:** append-heavy, analytical → stays
-  DuckDB/Parquet, with the planned **R2 export** as the historical/backtest
-  corpus once the volume's size cap bites.
+- **OLAP — market data, snapshots, raw_events, plus the durable Stage-3
+  `market_semantics`/`market_edges`:** append-heavy, analytical, read by the
+  solver → stays DuckDB/Parquet, with the planned **R2 export** as the
+  historical/backtest corpus once the volume's size cap bites. (The light
+  human-review mutations on `market_edges` are the one OLTP-ish wrinkle; they move
+  to Postgres only if a review UI ever needs concurrent writes.)
 
 ### Deployment shape as it grows
 The monorepo (above) already encodes the pattern: **one repo, per-service Root
@@ -425,9 +531,11 @@ boundary:
   consumer: `kalshi/{auth,rest,fixedpoint}`, `subscriber.py` (`BaseSubscriber`),
   `config.py`, `log.py`, `util.py`, the `Loop`/`Heartbeats` half of `runtime.py`,
   `supervisor.py`, `health.py`, `events.py`.
-- **ingest-specific (stays in `ingest/`)** — `loops/`, `discovery_predicates.py`,
-  `db.py` + `schema.sql`, `constants.py`, `orderbook.py`, `reconstruct.py`,
-  `app.py`, and the `BookStore`/`request_reset` half of `runtime.py`.
+- **ingest-specific (stays in `ingest/`)** — `loops/` (incl. `extraction.py`),
+  `discovery_predicates.py`, `pair_candidates.py`, `llm/` (the extraction
+  taxonomy/prompts are coherence-specific), `db.py` + `schema.sql`, `constants.py`,
+  `orderbook.py`, `reconstruct.py`, `app.py`, and the `BookStore`/`request_reset`
+  half of `runtime.py`.
 
 **Pre-extraction cleanup (known boundary leaks, do these when the split lands).**
 A core module must not import ingest-specific code; today three kinds of leak do:

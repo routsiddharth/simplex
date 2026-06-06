@@ -91,3 +91,59 @@ CREATE TABLE IF NOT EXISTS tracked_series (
     volume_24h         DOUBLE,
     rank_position      INTEGER           -- 1..MAX_TRACKED_SERIES, best first
 );
+
+-- LLM extraction layer (Stage 3). Both tables below hold *non-regenerable*
+-- LLM-derived artifacts: unlike snapshots/book_state they cannot be rebuilt from
+-- raw_events (the output is costly + non-deterministic + partly human-curated),
+-- so they get raw_events-grade durability — never casually wiped, included in
+-- backup. See ARCHITECTURE.md §5, §9.
+
+-- Per-market semantic representation (Stage A). One row per market, keyed on the
+-- market_id. Market descriptions don't change after listing, so a row is cached
+-- until extraction_version bumps (a prompt/schema change), not re-extracted each
+-- cycle. entities/dependencies are JSON arrays of normalized strings.
+CREATE TABLE IF NOT EXISTS market_semantics (
+    market_id          VARCHAR PRIMARY KEY,
+    platform           VARCHAR NOT NULL,
+    underlying_event   VARCHAR,          -- what real-world event this market is about
+    resolves_yes_when  VARCHAR,          -- condition that settles YES
+    resolves_no_when   VARCHAR,          -- condition that settles NO
+    resolution_timing  VARCHAR,          -- when / by what date it resolves
+    entities           JSON,             -- normalized real-world entities it depends on
+    dependencies       JSON,             -- real-world things its outcome hinges on
+    model              VARCHAR,          -- model id that produced this
+    extraction_version INTEGER,          -- bump invalidates the cache (re-extract)
+    extracted_at       TIMESTAMP,
+    raw_response       JSON              -- full model response, for audit
+);
+
+-- Pairwise typed logical edges between related markets (Stage B). One row per
+-- unordered pair, canonicalized so market_id_a < market_id_b. trust_tier drives
+-- how the (future) solver consumes the edge: `trusted` => hard constraint,
+-- `soft` => soft constraint, `review` => manual-review queue (the queue is the
+-- query `trust_tier='review' AND review_status='pending'` — no separate table).
+-- A `trusted` edge requires agreement_status='agreed' (two independent
+-- extractions concurred); see ARCHITECTURE.md §3 (Extraction loop) and §12.
+CREATE TABLE IF NOT EXISTS market_edges (
+    platform           VARCHAR NOT NULL,
+    market_id_a        VARCHAR NOT NULL,   -- canonical: a < b
+    market_id_b        VARCHAR NOT NULL,
+    relationship_type  VARCHAR,            -- same_event|implies|mutually_exclusive|partition_member|conditional|correlated|unrelated
+    direction          VARCHAR,            -- a_implies_b|b_implies_a|symmetric|none (for implies/conditional)
+    confidence         DOUBLE,             -- model self-reported, [0,1]
+    trust_tier         VARCHAR,            -- trusted|soft|review
+    agreement_status   VARCHAR,            -- single|agreed|disagreed
+    rationale          VARCHAR,            -- model's reasoning at classification time
+    model              VARCHAR,            -- primary classification model
+    verify_model       VARCHAR,            -- second model used for the trusted-promotion check (or null)
+    extraction_version INTEGER,
+    classified_at      TIMESTAMP,
+    raw_response       JSON,
+    review_status      VARCHAR DEFAULT 'pending',  -- pending|approved|rejected (only meaningful for trust_tier='review')
+    reviewed_at        TIMESTAMP,
+    reviewed_by        VARCHAR,
+    PRIMARY KEY (platform, market_id_a, market_id_b)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_review ON market_edges (trust_tier, review_status);
+CREATE INDEX IF NOT EXISTS idx_edges_market_a ON market_edges (market_id_a);
+CREATE INDEX IF NOT EXISTS idx_edges_market_b ON market_edges (market_id_b);

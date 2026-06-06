@@ -225,6 +225,91 @@ will stay idle. Informational — the process stays up either way."""
 
 
 # --------------------------------------------------------------------------
+# LLM extraction layer (Stage 3) — semantics + relationship edges
+# --------------------------------------------------------------------------
+# Behavior is tuned here; the ONLY env value the layer adds is the secret
+# OPENROUTER_API_KEY (see config.py). Model ids are constants so they swap
+# without touching the env surface. The layer soft-fails (idles) when the key is
+# absent, so plain ingest still runs without it.
+
+EXTRACTION_INTERVAL_SECONDS = 300
+"""How often the extraction loop wakes to (a) extract semantics for newly-active
+markets lacking them and (b) classify any new candidate pairs. 5 min keeps the
+graph close behind the catalog poller (also 5 min) without burning model spend on
+an empty work queue — both phases are no-ops when there's nothing new."""
+
+EXTRACTION_BATCH_SIZE = 50
+"""Max markets extracted AND max pairs classified per cycle. Bounds per-cycle
+model spend and keeps a cycle short enough to heartbeat comfortably; the backlog
+drains over subsequent cycles. Work is idempotent, so a partial cycle just
+resumes next tick."""
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+"""OpenRouter's OpenAI-compatible API root. Not a secret (the API *key* is, and
+lives in the env per config.py)."""
+
+EXTRACTION_MODEL = "anthropic/claude-sonnet-4.6"
+"""Stage A (per-market semantics): high-volume, runs once per market then caches,
+so a fast/cheap reasoning tier fits. Confirm the exact slug against OpenRouter's
+model catalog at deploy time."""
+
+PAIR_MODEL = "anthropic/claude-opus-4.8"
+"""Stage B primary (pair relationship): harder reasoning, lower volume (only
+candidate pairs), so the strongest tier earns its cost here."""
+
+PAIR_VERIFY_MODEL = "anthropic/claude-sonnet-4.6"
+"""Independent second opinion used ONLY to promote a high-confidence edge to the
+`trusted` (hard-constraint) tier. Deliberately a *different* model from
+PAIR_MODEL so agreement is genuine independence, not one model agreeing with
+itself. Disagreement demotes the edge to the manual-review queue."""
+
+EXTRACTION_PROMPT_VERSION = 1
+"""Cache key for both tables. Bump when the prompts/output schema change so the
+loop re-extracts semantics and re-classifies pairs (rows at an older version are
+treated as missing). Otherwise market_semantics is cached forever (descriptions
+don't change post-listing)."""
+
+LLM_TEMPERATURE = 0.0
+"""Sampling temperature for all extraction calls. 0.0 for stable, repeatable
+structured output; verification independence comes from a different *model*, not
+from temperature."""
+
+LLM_CALLS_PER_SECOND = 2.0
+"""Token-bucket refill rate for OpenRouter calls. Conservative — extraction is a
+background backlog drain, not latency-critical, and model spend is the real
+budget. Raise to drain a large first-boot backlog faster."""
+
+LLM_BURST = 4
+"""Token-bucket capacity (max burst) for OpenRouter calls."""
+
+LLM_MAX_RETRIES = 4
+"""Retries on 429 / transient 5xx / transport errors before the client raises
+LLMError (which the loop logs-and-skips for that one item)."""
+
+LLM_REQUEST_TIMEOUT_SECONDS = 60.0
+"""Per-request timeout for a chat completion. Reasoning models on hard pairs can
+be slow; generous so a slow-but-valid response isn't dropped."""
+
+PAIR_ENTITY_OVERLAP_MIN = 2
+"""Minimum shared normalized entities for two markets in different events/series
+to become a candidate pair. 2 avoids pairing on a single common entity (e.g. a
+year or a country) while still catching genuinely-related cross-series markets."""
+
+EDGE_TRUSTED_CONFIDENCE = 0.85
+"""At/above this primary-model confidence, an edge is a *candidate* for the
+`trusted` tier — promoted only if PAIR_VERIFY_MODEL independently agrees on the
+relationship type. `trusted` edges become the solver's hard constraints, so a
+wrong one is the highest-blast-radius failure; the agreement gate guards exactly
+this band."""
+
+EDGE_SOFT_CONFIDENCE = 0.6
+"""At/above this (but below trusted) an edge enters the graph as `soft` (a soft
+solver constraint). Below it, the model is too unsure to trust automatically →
+the `review` tier (manual-review queue). Disagreement on a trusted candidate also
+lands in `review`."""
+
+
+# --------------------------------------------------------------------------
 # Supervisor / health
 # --------------------------------------------------------------------------
 
@@ -236,7 +321,7 @@ backs off up to the max; a loop that runs cleanly for a while resets its
 backoff."""
 
 HEALTH_PORT = 8080
-"""Default port for the /health endpoint. 200 if all five loops are alive, 503
+"""Default port for the /health endpoint. 200 if all six loops are alive, 503
 otherwise. Overridden at runtime by the ``$PORT`` env var if the host platform
 injects one (Railway, Heroku, etc) — see :func:`health.start_health_server`."""
 
