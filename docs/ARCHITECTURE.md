@@ -237,7 +237,12 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   instead of letting the level trip `out_of_range_price` into an endless
   reset/re-anchor loop. The canary remains as a backstop (it can no longer fire
   for these, since the level never enters) — detectors are *not* softened; the
-  book is built correctly.
+  book is built correctly. The same `in_tradeable_band` predicate lives in the
+  decode module (`kalshi/fixedpoint.py`) and is applied to **both** the WS apply
+  path and the REST audit decode (`level_map`), so the in-memory book and the
+  audit's REST book exclude the same levels — otherwise a 0¢/100¢ level the book
+  drops but REST still reports would read as a permanent structural diff and the
+  audit would reset the book every hour.
 
 ### Book audit (`loops/audit.py`)
 - **Cadence:** wakes every `AUDIT_TICK_SECONDS` (1 h); runs a pass only when the

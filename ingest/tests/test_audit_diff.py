@@ -143,6 +143,19 @@ async def test_audit_beats_per_market_during_sweep():
     assert beats == ["audit"] * len(markets)
 
 
+async def test_audit_filters_out_of_band_rest_levels_no_reset():
+    """Step 6 symmetry: the in-memory book drops 0c/100c levels at apply time, so
+    the audit's REST decode must drop them too. With matching in-band levels and
+    only out-of-band extras reported by REST, the books agree — no phantom
+    structural diff, no perpetual reset (the regression this guards against)."""
+    status, action, structural, _p, reset = await _classify(
+        {0.40: 100.0}, {0.60: 50.0},
+        {0.40: 100.0, 0.00: 99.0, 1.00: 5.0}, {0.60: 50.0, 1.00: 80.0},
+    )
+    assert (status, action) == ("no_diff", "none")
+    assert structural == 0 and reset is False
+
+
 async def test_audit_gross_size_only_desync_forces_reset():
     # The restored backstop: same single level (structural=0), but its size is
     # off by a large factor (1 -> 1000, ~99.9%) -> a magnitude/decode bug the

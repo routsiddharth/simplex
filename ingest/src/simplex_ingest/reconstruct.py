@@ -24,6 +24,7 @@ from typing import Any
 
 from . import constants as C
 from .events import EventType
+from .kalshi.fixedpoint import in_tradeable_band
 from .log import get_logger
 from .orderbook import OrderBook
 
@@ -109,7 +110,7 @@ class BookReconstructor:
             price = payload.get("price")
             delta = payload.get("delta")
             if side in ("yes", "no") and price is not None and delta is not None:
-                if _in_band(price):
+                if in_tradeable_band(price):
                     self.book.apply_delta(side, price, delta)
                 else:
                     # A delta at a non-tradeable (0c/100c-ish) price: the level was
@@ -167,25 +168,18 @@ class BookReconstructor:
         return self.book.serialize()
 
 
-_BAND_EPS = 1e-9
-
-
-def _in_band(price: float) -> bool:
-    """A resting level is tradeable iff its price is within the canary band
-    (1c..99c). Levels outside it (0c/100c extremes, or a decode glitch) are not
-    valid resting orders and are excluded from the book at apply time."""
-    return (C.CANARY_PRICE_MIN_USD - _BAND_EPS) <= price <= (C.CANARY_PRICE_MAX_USD + _BAND_EPS)
-
-
 def _split_in_band(
     levels: list,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """Partition snapshot ``[price, size]`` pairs into (in-band, out-of-band)."""
+    """Partition snapshot ``[price, size]`` pairs into (in-band, out-of-band) by
+    the shared :func:`~simplex_ingest.kalshi.fixedpoint.in_tradeable_band`
+    predicate — the same one the REST audit decode uses, so the in-memory book
+    and the audit's REST book exclude the same levels."""
     in_band: list[tuple[float, float]] = []
     out_of_band: list[tuple[float, float]] = []
     for x in levels:
         pair = tuple(x)
-        (in_band if _in_band(pair[0]) else out_of_band).append(pair)
+        (in_band if in_tradeable_band(pair[0]) else out_of_band).append(pair)
     return in_band, out_of_band
 
 

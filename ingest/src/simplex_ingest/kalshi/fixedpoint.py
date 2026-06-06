@@ -13,7 +13,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import constants as C
 from ..orderbook import _q
+
+_BAND_EPS = 1e-9
+
+
+def in_tradeable_band(price: float) -> bool:
+    """A resting level is tradeable iff priced within the canary band
+    (``CANARY_PRICE_MIN_USD``..``CANARY_PRICE_MAX_USD``, i.e. 1¢–99¢). Levels
+    outside it — a near-decided market resting at 0¢/100¢, or a decode glitch —
+    are not valid resting orders.
+
+    The single home for "is this a real level": the WS apply path
+    (:class:`~simplex_ingest.reconstruct.BookReconstructor`) and the REST audit
+    decode (:func:`level_map`) both drop the same levels, so the in-memory book
+    and the REST comparison stay apples-to-apples — otherwise a level the book
+    excludes but REST still reports would read as a permanent structural diff and
+    reset the book forever."""
+    return (C.CANARY_PRICE_MIN_USD - _BAND_EPS) <= price <= (C.CANARY_PRICE_MAX_USD + _BAND_EPS)
 
 
 def to_float(value: Any) -> float | None:
@@ -46,10 +64,12 @@ def level_map(raw: Any) -> dict[float, float]:
 
     The REST audit decode: keys are quantized the same way the in-memory
     :class:`~simplex_ingest.orderbook.OrderBook` quantizes, so the two diff
-    cleanly."""
+    cleanly. Out-of-band levels are dropped here to match the in-memory book
+    (which excludes them at apply time) — see :func:`in_tradeable_band`."""
     out: dict[float, float] = {}
     for p, s in levels(raw):
-        out[_q(p)] = s
+        if in_tradeable_band(p):
+            out[_q(p)] = s
     return out
 
 

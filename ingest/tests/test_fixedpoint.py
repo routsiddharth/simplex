@@ -3,7 +3,9 @@ numeric surface. A units question lands here, so it gets exhaustive coverage."""
 
 from __future__ import annotations
 
-from simplex_ingest.kalshi.fixedpoint import level_map, levels, to_float, volume
+from simplex_ingest.kalshi.fixedpoint import (
+    in_tradeable_band, level_map, levels, to_float, volume,
+)
 
 
 # -- to_float ---------------------------------------------------------------
@@ -30,6 +32,22 @@ def test_level_map_quantizes_keys():
     out = level_map([["0.400000001", "100"], ["0.55", "80"]])
     assert out == {0.4: 100.0, 0.55: 80.0}      # price rounded to 6dp
     assert level_map(None) == {}
+
+
+def test_level_map_drops_out_of_band_levels():
+    # 0c/100c extremes are dropped so the REST audit book matches the in-memory
+    # book (which excludes them at apply time) — no phantom structural diff.
+    out = level_map([["0.00", "99"], ["0.40", "100"], ["1.00", "5"]])
+    assert out == {0.40: 100.0}
+
+
+# -- in_tradeable_band ------------------------------------------------------
+
+def test_in_tradeable_band_bounds():
+    assert in_tradeable_band(0.01) and in_tradeable_band(0.99)   # inclusive bounds
+    assert in_tradeable_band(0.50)
+    assert not in_tradeable_band(0.0) and not in_tradeable_band(1.0)
+    assert not in_tradeable_band(5.6)                            # decode-glitch territory
 
 
 # -- volume -----------------------------------------------------------------
