@@ -12,14 +12,14 @@ and the next steps** — written to continue in a fresh session.
 
 | | |
 |---|---|
-| **Deployed (`origin/main`)** | `7a4be4a` — Steps 1–4, 6 + metrics + audit-symmetry fix |
-| **Uncommitted in working tree** | liquidity floor (`CATALOG_MIN_MARKET_VOLUME` 0→100) + bulk snapshot upsert + tests + docs. **Commit prepared; a direct push to `main` was blocked by the auto-approve classifier — needs a manual `git push`.** |
+| **On `origin/main`** | `9529b6c` — everything below is pushed: Steps 1–4/6 + metrics (`0dae582`), audit-symmetry (`7a4be4a`), liquidity floor + bulk upsert (`64ea5f2`), cheap-model cost measure (`1044034`), docs (`9529b6c`). Working tree clean. |
 | **Tests** | `240 passed, 4 skipped` (live smoke skipped) |
-| **Live status (last measured ~21:58 UTC 06-06)** | **still flapping** (`reconnects` ~1/min, `keepalive ping timeout`); grid 30–80 s; `mean_sample_ms ≈ 25 000` |
-| **Verdict** | The plan's root-cause (drain bursts → yields cure it) was **wrong**. The real bottleneck is the **per-tick snapshot DB write** at ~5.5 k markets. The uncommitted floor+bulk change targets the *actual* cause; awaiting redeploy to confirm. |
+| **Live status (last measured ~21:58 UTC 06-06, on the `7a4be4a` build)** | **still flapping** (`reconnects` ~1/min, `keepalive ping timeout`); grid 30–80 s; `mean_sample_ms ≈ 25 000`. The floor+bulk fix (`64ea5f2`) had **not** deployed yet at that measurement. |
+| **Verdict** | The plan's root-cause (drain bursts → yields cure it) was **wrong**. The real bottleneck is the **per-tick snapshot DB write** at ~5.5 k markets. The floor+bulk change targets the *actual* cause; **awaiting the redeploy to confirm.** |
 
-**Immediate next action:** push the uncommitted commit, let it deploy, then
-re-measure `ws metrics reconnects` and `snapshot metrics mean_sample_ms`.
+**Immediate next action:** let `origin/main` deploy, wait ~30–45 min, then
+re-measure `ws metrics reconnects` (should go flat) and `snapshot metrics
+mean_sample_ms` (should be < ~3 000).
 
 ---
 
