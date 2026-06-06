@@ -247,11 +247,12 @@ Watch the logs and confirm, in order — this is the end-to-end cutover signatur
    (`frames_per_s`, `reconnects`, `reconciles`, `resets`) — watch `reconnects`
    stay ~flat (no keepalive-timeout flapping) and `mean_sample_ms` stay well under
    the 10 s budget. The catalog also logs `catalog volume distribution`
-   (percentiles + counts below candidate floors) — **use this to set
-   `CATALOG_MIN_MARKET_VOLUME`**: read the percentiles off a live deploy, then
-   raise the floor (and/or lower `MAX_ACTIVE_MARKETS`) to drop the near-zero-
-   liquidity tail. A `dropping out-of-range level` line names any market resting
-   at a non-tradeable price (its level is excluded; the book stays valid).
+   (percentiles + counts below candidate floors) — the source for
+   `CATALOG_MIN_MARKET_VOLUME` (**100** from the first deploy's distribution,
+   which showed ~47 % of markets below 100 lifetime contracts; re-read the
+   percentiles and re-tune, and/or lower `MAX_ACTIVE_MARKETS`, if the catalog
+   shifts). A `dropping out-of-range level` line names any market resting at a
+   non-tradeable price (its level is excluded; the book stays valid).
 5. **If `OPENROUTER_API_KEY` is set:** `semantics extracted` (per market), then
    `edge classified` (per pair), then `extraction cycle complete`
    — `reconciled=… semantics=… edges=…` (within one `EXTRACTION_INTERVAL`, after

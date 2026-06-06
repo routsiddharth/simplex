@@ -68,8 +68,8 @@ async def test_refresh_persists_metadata_and_retires_dropped_market(
     rest = make_fake_rest(events=[make_event(
         series="KXCAT", mutex=True,
         markets=[
-            make_market("KXCAT-A", status="active", subtitle="A"),
-            make_market("KXCAT-B", status="active", subtitle="B"),
+            make_market("KXCAT-A", status="active", subtitle="A", volume=1000),
+            make_market("KXCAT-B", status="active", subtitle="B", volume=1000),
         ],
     )])
     rt = _catalog_runtime(tmp_db, rest)
@@ -82,7 +82,7 @@ async def test_refresh_persists_metadata_and_retires_dropped_market(
     # is no longer in the active subscription set.
     rest.events = [make_event(
         series="KXCAT", mutex=True,
-        markets=[make_market("KXCAT-A", status="active", subtitle="A")],
+        markets=[make_market("KXCAT-A", status="active", subtitle="A", volume=1000)],
     )]
     await CatalogPoller(rt).refresh()
 
@@ -90,6 +90,24 @@ async def test_refresh_persists_metadata_and_retires_dropped_market(
     with tmp_db._lock:
         ids = {r[0] for r in tmp_db._con.execute("SELECT market_id FROM markets").fetchall()}
     assert ids == {"KXCAT-A", "KXCAT-B"}  # B's history is kept
+
+
+async def test_liquidity_floor_excludes_low_volume_markets(
+    tmp_db, make_fake_rest, make_event, make_market
+):
+    """Markets below CATALOG_MIN_MARKET_VOLUME are not subscribed (the dead-weight
+    cut); those at/above it are kept."""
+    tmp_db.replace_tracked_series([_tracked_row("KXCAT")])
+    rest = make_fake_rest(events=[make_event(
+        series="KXCAT", mutex=True,
+        markets=[
+            make_market("KXCAT-DEAD", status="active", subtitle="d", volume=5.0),
+            make_market("KXCAT-LIVE", status="active", subtitle="l", volume=500.0),
+        ],
+    )])
+    rt = _catalog_runtime(tmp_db, rest)
+    await CatalogPoller(rt).refresh()
+    assert tmp_db.get_active_market_ids() == {"KXCAT-LIVE"}
 
 
 async def test_ceiling_keeps_highest_volume_markets(

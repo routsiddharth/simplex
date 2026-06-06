@@ -195,8 +195,16 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     core, independent of market count);
   - the **sampler** wakes each 10 s boundary and only *reads* the current books
     into one grid row per active market (yielding every `SNAPSHOT_ROW_YIELD_EVERY`
-    markets, **between markets**), then upserts. It does no draining, so a heavy
-    apply (e.g. a market mid-resync) never delays the grid.
+    markets, **between markets**), then **bulk-upserts** them. It does no
+    draining, so a heavy apply (e.g. a market mid-resync) never delays the grid.
+
+  The per-tick write is one row per active market — thousands at the live catalog
+  size — and that DuckDB write, **not** the event drain or the Python row-build
+  (~20 ms), was found to dominate the tick (≈25 s of a sample at ~5.5 k markets in
+  the first deploy of the split). `db.upsert_snapshots` packs the rows into a few
+  multi-row `INSERT … ON CONFLICT` statements instead of a row-by-row
+  `executemany` (a DuckDB/columnar anti-pattern), and the catalog liquidity floor
+  (below) keeps the row count bounded.
   Both run on the single event loop, so the sampler's synchronous per-market read
   can never observe a half-applied book — no locks. The synchronous full-cycle
   `tick()` (refresh → drain → emit) is retained as the entry point for tests and

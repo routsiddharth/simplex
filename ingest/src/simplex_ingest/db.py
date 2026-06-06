@@ -50,11 +50,19 @@ ON CONFLICT (market_id) DO UPDATE SET
     last_seen_ts = EXCLUDED.last_seen_ts
 """  # NB: deliberately does not touch `subscribed` (managed separately).
 
-_SNAPSHOT_UPSERT = """
-INSERT INTO snapshots (ts, platform, market_id, yes_bid, yes_ask, yes_mid,
-    bid_depth_3c_usd, ask_depth_3c_usd, bid_levels_in_3c, ask_levels_in_3c,
-    volume_10s, last_trade_price, status, built_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+# Snapshot upsert, composed so the row VALUES list can be repeated for a
+# multi-row (bulk) insert. The snapshot loop writes one row per active market
+# every tick (thousands at the live catalog size); row-by-row `executemany` is a
+# DuckDB (columnar) anti-pattern that dominated the tick wall-clock, so
+# `upsert_snapshots` packs many rows into a single statement (see there).
+_SNAPSHOT_COLS = (
+    "ts, platform, market_id, yes_bid, yes_ask, yes_mid, "
+    "bid_depth_3c_usd, ask_depth_3c_usd, bid_levels_in_3c, ask_levels_in_3c, "
+    "volume_10s, last_trade_price, status, built_ts"
+)
+_SNAPSHOT_NCOLS = 14
+_SNAPSHOT_ROW_PLACEHOLDER = "(" + ", ".join(["?"] * _SNAPSHOT_NCOLS) + ")"
+_SNAPSHOT_CONFLICT = """
 ON CONFLICT (ts, platform, market_id) DO UPDATE SET
     yes_bid = EXCLUDED.yes_bid,
     yes_ask = EXCLUDED.yes_ask,
@@ -68,6 +76,9 @@ ON CONFLICT (ts, platform, market_id) DO UPDATE SET
     status = EXCLUDED.status,
     built_ts = EXCLUDED.built_ts
 """
+# Rows per bulk INSERT statement. Bounds statement/parameter size while still
+# collapsing thousands of rows into a handful of executes.
+_SNAPSHOT_UPSERT_CHUNK = 1000
 
 _BOOK_UPSERT = """
 INSERT INTO book_state (market_id, last_sequence, last_ts, serialized_book)
@@ -270,10 +281,23 @@ class Database:
     # -- snapshots ----------------------------------------------------------
 
     def upsert_snapshots(self, rows: list[tuple[Any, ...]]) -> None:
+        """Bulk-upsert one row per active market. Packs up to
+        ``_SNAPSHOT_UPSERT_CHUNK`` rows into a single multi-row
+        ``INSERT … VALUES (…),(…),… ON CONFLICT DO UPDATE`` so the per-tick write
+        is a handful of vectorized statements instead of thousands of single-row
+        inserts (the dominant snapshot-tick cost at the live catalog size).
+        Idempotent on ``(ts, platform, market_id)``, unchanged from before."""
         if not rows:
             return
         with self._lock:
-            self._con.executemany(_SNAPSHOT_UPSERT, rows)
+            for start in range(0, len(rows), _SNAPSHOT_UPSERT_CHUNK):
+                chunk = rows[start : start + _SNAPSHOT_UPSERT_CHUNK]
+                values = ", ".join([_SNAPSHOT_ROW_PLACEHOLDER] * len(chunk))
+                params = [v for row in chunk for v in row]
+                self._con.execute(
+                    f"INSERT INTO snapshots ({_SNAPSHOT_COLS}) VALUES {values}{_SNAPSHOT_CONFLICT}",
+                    params,
+                )
 
     # -- book_state ---------------------------------------------------------
 

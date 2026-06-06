@@ -78,16 +78,17 @@ by the discovery loop), re-expands it against Kalshi REST, and reconciles the
 active subscription set. 5 min balances freshness of newly-opened markets and
 of discovery's latest tracked set against REST budget."""
 
-CATALOG_MIN_MARKET_VOLUME = 0.0
-"""Liquidity floor (contracts) for a market to enter the active set. 0.0 keeps
-every open market in a tracked series. Raise to prune dead markets and shrink
-the WS firehose. Applied in the catalog poller.
+CATALOG_MIN_MARKET_VOLUME = 100.0
+"""Liquidity floor (contracts) for a market to enter the active set. Applied in
+the catalog poller; markets below it are not subscribed.
 
-Still 0.0 deliberately: the right floor is set from the live volume distribution
-the catalog poller now logs each refresh (``catalog volume distribution`` — see
-``CatalogPoller._log_volume_distribution``). Read the percentiles off a deploy,
-then raise this to drop the near-zero-liquidity primary candidate markets that
-carry no coherence signal. Until then nothing is silently cut on liquidity."""
+Set from the live volume distribution (`catalog volume distribution`, logged each
+refresh): at floor=0 the catalog carried ~5.5k markets, of which ~2.6k had <100
+lifetime contracts and ~1.8k had <1 — near-dead markets that bloat the WS
+firehose and the per-tick snapshot grid while carrying no coherence signal. A
+floor of 100 drops that tail (~47%), keeping anything with real activity. Raise
+further to shed more load at the cost of thin partition members; lower it to keep
+more of the long tail. Pair with ``MAX_ACTIVE_MARKETS`` (the hard ceiling)."""
 
 MAX_ACTIVE_MARKETS = 6000
 """Hard ceiling on the active-market count *after* series→market fan-out, applied

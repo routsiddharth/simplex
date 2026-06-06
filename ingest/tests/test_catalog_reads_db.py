@@ -32,8 +32,8 @@ async def test_refresh_expands_tracked_series(tmp_db, make_fake_rest, make_event
             series="KXCAT",
             mutex=True,
             markets=[
-                make_market("KXCAT-A", status="active", subtitle="A"),
-                make_market("KXCAT-B", status="active", subtitle="B"),
+                make_market("KXCAT-A", status="active", subtitle="A", volume=1000),
+                make_market("KXCAT-B", status="active", subtitle="B", volume=1000),
                 make_market("KXCAT-C", status="settled", subtitle="C"),  # not tradeable
             ],
         )
