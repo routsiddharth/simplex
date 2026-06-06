@@ -83,14 +83,15 @@ class DiscoveryLoop:
             return
 
         stats = aggregate(events)
-        admitted = [s for s in stats.values() if evaluate(s).admit]
-        admitted.sort(key=rank_key, reverse=True)
+        # Evaluate each series once; carry the Verdict alongside the stats so the
+        # row build below reuses it instead of re-running the predicates.
+        admitted = [(s, v) for s in stats.values() if (v := evaluate(s)).admit]
+        admitted.sort(key=lambda sv: rank_key(sv[0]), reverse=True)
         top = admitted[: C.MAX_TRACKED_SERIES]
 
         now = naive_utc(now_utc())
         rows = []
-        for position, s in enumerate(top, start=1):
-            v = evaluate(s)
+        for position, (s, v) in enumerate(top, start=1):
             rows.append(
                 (
                     s.ticker,

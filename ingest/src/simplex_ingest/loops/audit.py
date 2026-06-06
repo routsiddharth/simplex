@@ -81,6 +81,12 @@ class BookAuditLoop:
         log.info("audit pass start", extra={"markets": len(markets)})
         results: list[tuple] = []
         for market in sorted(markets):
+            # Beat per market: a large catalog (e.g. a many-outcome series like
+            # KXNBADRAFTPICK) makes this REST sweep run for minutes at
+            # AUDIT_REST_CALLS_PER_SECOND, and without a mid-sweep heartbeat the
+            # loop's liveness goes stale past HEALTH_HEARTBEAT_TIMEOUT_SECONDS and
+            # /health 503s through the deploy grace. Mirrors the extraction loop.
+            self.rt.heartbeats.beat(self.name)
             try:
                 results.append(await self._audit_market(market))
             except Exception as exc:

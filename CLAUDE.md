@@ -60,7 +60,7 @@ python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env                       # 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY + ANTHROPIC_API_KEY optional
 python -m simplex_ingest                   # run the ingest; GET :8080/health
-pytest                                     # 226 hermetic tests (units: predicates, candidates,
+pytest                                     # 231 hermetic tests (units: predicates, candidates,
                                            #   spend gate, orderbook, reconstruct, fixedpoint,
                                            #   auth/REST/LLM/batch clients, supervisor, health, DB;
                                            #   loops incl. batch routing/reconcile + full

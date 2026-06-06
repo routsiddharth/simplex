@@ -37,9 +37,11 @@ required pre-extraction cleanup is recorded in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) §11.
 
 Outcome: a self-contained `ingest/` deployable, docs corrected for the real
-topology, and a documented path to the fleet — with near-zero churn (the code
-and build files are move-safe; no Dockerfile/`railway.json`/`pyproject` content
-edits required).
+topology, and a documented path to the fleet — with near-zero churn. *The move
+proper* needs no build-file content edits (the code and build files are
+move-safe). The only content edits are the dangling-reference cleanup in step 7:
+deleting `README-DEPLOY.md` forces stripping its line from `Dockerfile` and
+`.dockerignore` — a consequence of the deletion, not of the relocation.
 
 ---
 
@@ -155,7 +157,9 @@ Capture these in DEPLOY §7.
 
 ### 7. Cleanup (deprecated root files)
 - `README-DEPLOY.md` — superseded by `docs/DEPLOY.md` (it already says so).
-  **Delete** (confirm it only points at `docs/DEPLOY.md` before removing).
+  **Delete** (confirm it only points at `docs/DEPLOY.md` before removing). Note:
+  deleting it requires stripping its reference from `Dockerfile` and
+  `.dockerignore` (both listed it) — the one content edit the cleanup forces.
 - `requirements.txt` — legacy; `pyproject.toml` is the source of truth. Delete
   if unreferenced (grep first), else move into `ingest/`.
 
@@ -164,7 +168,8 @@ Capture these in DEPLOY §7.
 ## Verification
 
 Run from `ingest/` after the move:
-1. `pip install -e ".[test]"` then `pytest` → **116 passing** (no import breakage).
+1. `pip install -e ".[test]"` then `pytest` → **all green, no import breakage**
+   (the suite was 116 when this plan was written; it has since grown — 231 today).
 2. `python -m simplex_ingest` against `KALSHI_ENV=demo` → `/health` 200; log
    shows the cutover signature (`discovery cycle complete`, `catalog refreshed`,
    `ws reconciled`/`ws initial subscribe`, `snapshots emitted`).
@@ -193,4 +198,4 @@ and **fix everything each surfaces** before considering the work done:
 3. **`/security-review`** — invoke it, then fix all issues (ensure the move,
    `.dockerignore` relocation, and any path/build changes introduced no exposure).
 
-Re-run `pytest` (expect 116 green) after each round of fixes.
+Re-run `pytest` (expect all green) after each round of fixes.

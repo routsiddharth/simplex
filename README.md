@@ -198,8 +198,10 @@ ingest/                      # the ingest service — self-contained, deployable
     subscriber.py            # BaseSubscriber (one new file per future exchange)
     runtime.py supervisor.py health.py util.py log.py
     discovery_predicates.py  # pure admit/rank predicates (no I/O)
+    pair_candidates.py       # pure pair generation + spend-gate routing (no I/O)
     kalshi/    auth.py rest.py subscriber.py fixedpoint.py
-    loops/     catalog.py websocket.py snapshots.py audit.py discovery.py
+    llm/       client.py batch.py   # OpenRouter sync + Anthropic batch clients
+    loops/     catalog.py websocket.py snapshots.py audit.py discovery.py extraction.py
   tests/                     # pytest suite: predicates, DB atomicity, loop
 docs/      ARCHITECTURE.md DEPLOY.md   # repo-level
 README.md  CLAUDE.md

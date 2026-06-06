@@ -213,6 +213,14 @@ heartbeat within `HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s), else 503. The
 healthcheck has a 300 s grace at deploy time. `extraction` reports healthy even
 without `OPENROUTER_API_KEY` (it heartbeats while idle).
 
+Loops that do long per-item work **beat mid-work**, not just at end-of-cycle, so
+a single multi-minute pass can't stale a loop past the 90 s timeout: `audit`
+beats per market and `extraction` beats per item. This matters at deploy time —
+the audit loop's first tick sweeps the whole catalog at `AUDIT_REST_CALLS_PER_SECOND`,
+which on a many-outcome series (e.g. `KXNBADRAFTPICK`) runs for minutes; without
+the per-market beat that sweep would 503 `/health` through the entire 300 s grace
+and Railway would fail-and-roll-back the deploy.
+
 ```bash
 curl https://<service-domain>/health
 # {"healthy": true, "loops": {"catalog": true, "websocket": true,

@@ -118,6 +118,31 @@ async def test_audit_many_structural_mismatches_force_reset():
     assert structural == C.AUDIT_STRUCTURAL_DIFF_MAX_LEVELS + 1 and reset is True
 
 
+async def test_audit_beats_per_market_during_sweep():
+    """A long REST sweep must keep the loop's heartbeat fresh: ``run_pass``
+    beats once per market, not just at end-of-cycle, so ``/health`` stays green
+    while a large catalog is swept. Regression for the Railway healthcheck
+    rollback (the audit sweep over a many-outcome series ran past the heartbeat
+    timeout, 503-ing the deploy through its grace)."""
+    beats: list[str] = []
+    markets = ["M1", "M2", "M3", "M4"]
+
+    async def get_orderbook(market, depth):
+        return {"yes_dollars": [], "no_dollars": []}
+
+    rt = SimpleNamespace(
+        book_store=SimpleNamespace(freeze=lambda m: None),
+        audit_rest=SimpleNamespace(get_orderbook=get_orderbook),
+        heartbeats=SimpleNamespace(beat=lambda name: beats.append(name)),
+        db=SimpleNamespace(
+            get_active_market_ids=lambda: list(markets),
+            insert_audit_results=lambda rows: None,
+        ),
+    )
+    await BookAuditLoop(rt).run_pass()
+    assert beats == ["audit"] * len(markets)
+
+
 async def test_audit_gross_size_only_desync_forces_reset():
     # The restored backstop: same single level (structural=0), but its size is
     # off by a large factor (1 -> 1000, ~99.9%) -> a magnitude/decode bug the
