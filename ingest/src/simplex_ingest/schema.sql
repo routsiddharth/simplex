@@ -147,3 +147,25 @@ CREATE TABLE IF NOT EXISTS market_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_review ON market_edges (trust_tier, review_status);
 CREATE INDEX IF NOT EXISTS idx_edges_market_a ON market_edges (market_id_a);
 CREATE INDEX IF NOT EXISTS idx_edges_market_b ON market_edges (market_id_b);
+
+-- In-flight Anthropic Message Batches (Stage 3, async spend path). A batch is
+-- submit-now / retrieve-later: cycle N submits, cycle N+k polls and reconciles.
+-- The batch_id + the work it covers MUST be durable (not in-process memory) or a
+-- restart orphans a submitted batch — Anthropic keeps results 29 days, so a
+-- persisted id is recoverable. `payload` maps each request's custom_id to the
+-- context needed to write its result: a market_id (purpose='semantics'), a
+-- canonical [a, b] pair (purpose='pair_primary'), or {pair, primary:{...}} carrying
+-- the primary classification forward to its verify (purpose='pair_verify'). A row
+-- is deleted once reconciled (its results have been written), so this table holds
+-- only genuinely-open batches. NOT regenerable from raw_events — durable like the
+-- rest of the graph. See ARCHITECTURE.md §3 and docs/LLM-COST-MIGRATION.md.
+CREATE TABLE IF NOT EXISTS llm_batches (
+    batch_id           VARCHAR PRIMARY KEY,
+    provider           VARCHAR NOT NULL,   -- 'anthropic'
+    purpose            VARCHAR NOT NULL,   -- semantics | pair_primary | pair_verify
+    model              VARCHAR,
+    extraction_version INTEGER,
+    request_count      INTEGER,
+    submitted_at       TIMESTAMP,
+    payload            JSON NOT NULL       -- custom_id -> result-handling context
+);

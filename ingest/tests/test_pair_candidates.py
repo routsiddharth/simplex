@@ -1,11 +1,21 @@
-"""Tests for the pure candidate-pair generator (Stage B input)."""
+"""Tests for the pure candidate-pair generator + the spend gate (Stage B input)."""
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta
 
 from hypothesis import given
 from hypothesis import strategies as st
 
-from simplex_ingest.pair_candidates import candidate_pairs
+from simplex_ingest import constants as C
+from simplex_ingest.pair_candidates import (
+    ROUTE_BATCH,
+    ROUTE_SKIP,
+    ROUTE_SYNC,
+    candidate_pairs,
+    remaining_life_seconds,
+    route_pair,
+)
 
 
 def _m(mid, series=None, event=None, entities=()):
@@ -68,6 +78,64 @@ def test_no_self_pairs_and_empty_inputs():
 def test_three_in_one_event_yields_all_three_pairs():
     markets = [_m("A", event="E"), _m("B", event="E"), _m("C", event="E")]
     assert candidate_pairs(markets) == [("A", "B"), ("A", "C"), ("B", "C")]
+
+
+# -- time-to-resolution spend gate -----------------------------------------
+
+_NOW = datetime(2026, 6, 6, 12, 0, 0)
+
+
+def _mc(mid, closes_in_hours=None):
+    """A market dict carrying a closes_at relative to _NOW (None = unknown)."""
+    closes = None if closes_in_hours is None else _NOW + timedelta(hours=closes_in_hours)
+    return {"market_id": mid, "closes_at": closes}
+
+
+def test_remaining_life_uses_closes_at():
+    assert remaining_life_seconds(_mc("A", closes_in_hours=2), _NOW) == 2 * 3600
+    assert remaining_life_seconds(_mc("A", closes_in_hours=None), _NOW) is None
+
+
+def test_route_skip_below_floor():
+    # Nearer endpoint resolves in 1h — under the 24h floor → don't spend.
+    a = _mc("A", closes_in_hours=1)
+    b = _mc("B", closes_in_hours=100)
+    assert route_pair(a, b, _NOW) == ROUTE_SKIP
+
+
+def test_route_sync_between_floor_and_threshold():
+    # 36h remaining: above the 24h floor, below the 48h batch threshold → sync.
+    a = _mc("A", closes_in_hours=36)
+    b = _mc("B", closes_in_hours=200)
+    assert route_pair(a, b, _NOW) == ROUTE_SYNC
+
+
+def test_route_batch_above_threshold():
+    a = _mc("A", closes_in_hours=200)
+    b = _mc("B", closes_in_hours=400)
+    assert route_pair(a, b, _NOW) == ROUTE_BATCH
+
+
+def test_route_binds_on_nearer_endpoint():
+    # B is long-lived but A is short-fuse → the pair binds on A → skip.
+    a = _mc("A", closes_in_hours=2)
+    b = _mc("B", closes_in_hours=1000)
+    assert route_pair(a, b, _NOW) == ROUTE_SKIP
+
+
+def test_route_unknown_life_defaults_to_sync():
+    # No close time on either endpoint → conservative: classify, don't skip.
+    assert route_pair(_mc("A"), _mc("B"), _NOW) == ROUTE_SYNC
+    # One known (long) endpoint still routes off the one we know.
+    assert route_pair(_mc("A"), _mc("B", closes_in_hours=400), _NOW) == ROUTE_BATCH
+
+
+def test_route_thresholds_match_constants():
+    # The exact boundary values come from constants (24h floor / 48h batch).
+    assert C.EDGE_REMAINING_LIFE_FLOOR_SECONDS == 86400
+    assert C.EDGE_BATCH_THRESHOLD_SECONDS == 172800
+    just_under_floor = _mc("A", closes_in_hours=23.9)
+    assert route_pair(just_under_floor, _mc("B", closes_in_hours=400), _NOW) == ROUTE_SKIP
 
 
 @given(

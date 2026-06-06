@@ -18,7 +18,7 @@ from .health import start_health_server
 from .kalshi.auth import KalshiSigner
 from .kalshi.rest import KalshiREST
 from .kalshi.subscriber import KalshiSubscriber
-from .llm import OpenRouterClient
+from .llm import AnthropicBatchClient, OpenRouterClient
 from .log import configure_logging, get_logger
 from .loops.audit import BookAuditLoop
 from .loops.catalog import CatalogPoller
@@ -42,6 +42,7 @@ class Runtime:
     audit_rest: KalshiREST
     subscriber: KalshiSubscriber
     llm: OpenRouterClient | None
+    batch: AnthropicBatchClient | None
     book_store: BookStore
     reset_requests: "asyncio.Queue[str]"
     resubscribe_event: asyncio.Event
@@ -75,6 +76,23 @@ def build_runtime(settings: Settings) -> Runtime:
         if settings.openrouter_api_key
         else None
     )
+    # The discounted async spend path (Stage 3). Built only when its secret is
+    # present; absent it, batch-routed extraction work degrades to the sync path.
+    batch = (
+        AnthropicBatchClient(
+            settings.anthropic_api_key,
+            C.ANTHROPIC_BASE_URL,
+            TokenBucket(C.LLM_CALLS_PER_SECOND, C.LLM_BURST),
+            version=C.ANTHROPIC_VERSION,
+            max_retries=C.LLM_MAX_RETRIES,
+            timeout=C.LLM_REQUEST_TIMEOUT_SECONDS,
+            backoff_min=C.WS_RECONNECT_MIN_SECONDS,
+            backoff_max=C.WS_RECONNECT_MAX_SECONDS,
+            backoff_factor=C.WS_RECONNECT_BACKOFF_FACTOR,
+        )
+        if settings.anthropic_api_key
+        else None
+    )
     return Runtime(
         settings=settings,
         db=db,
@@ -83,6 +101,7 @@ def build_runtime(settings: Settings) -> Runtime:
         audit_rest=audit_rest,
         subscriber=subscriber,
         llm=llm,
+        batch=batch,
         book_store=BookStore(),
         reset_requests=asyncio.Queue(maxsize=C.RESET_REQUEST_QUEUE_MAXSIZE),
         resubscribe_event=asyncio.Event(),
@@ -164,6 +183,8 @@ async def run() -> int:
     await rt.audit_rest.aclose()
     if rt.llm is not None:
         await rt.llm.aclose()
+    if rt.batch is not None:
+        await rt.batch.aclose()
     rt.db.close()
 
     health_server.close()

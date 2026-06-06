@@ -346,13 +346,16 @@ class Database:
 
     def get_active_markets_with_semantics(self) -> list[dict[str, Any]]:
         """Active markets that already have a semantics row, joined with the
-        hierarchy keys + entities the pair stage needs (candidate gen + prompt)."""
+        hierarchy keys + entities the pair stage needs (candidate gen + prompt).
+
+        ``closes_at`` is carried through so the Stage B spend gate can compute each
+        pair's remaining life (see :func:`..pair_candidates.route_pair`)."""
         with self._lock:
             rows = self._con.execute(
                 """
                 SELECT m.market_id, m.title, m.series_ticker, m.event_ticker,
                        s.underlying_event, s.resolves_yes_when, s.resolves_no_when,
-                       s.resolution_timing, s.entities, s.dependencies
+                       s.resolution_timing, s.entities, s.dependencies, m.closes_at
                 FROM markets m
                 JOIN market_semantics s ON s.market_id = m.market_id
                 WHERE m.subscribed = TRUE
@@ -372,6 +375,7 @@ class Database:
                     "resolution_timing": r[7],
                     "entities": json.loads(r[8]) if r[8] else [],
                     "dependencies": json.loads(r[9]) if r[9] else [],
+                    "closes_at": r[10],
                 }
             )
         return out
@@ -434,6 +438,74 @@ class Database:
                 "ORDER BY confidence DESC"
             ).fetchall()
         return self._edge_dicts(rows)
+
+    # -- llm_batches (async spend path, in-flight state) -------------------
+
+    def insert_batch(
+        self, batch_id: str, *, provider: str, purpose: str, model: str,
+        version: int, request_count: int, submitted_at: datetime, payload: dict,
+    ) -> None:
+        """Record a freshly-submitted batch + the work it covers (so a restart
+        can recover it). ``payload`` maps custom_id -> result-handling context."""
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO llm_batches (batch_id, provider, purpose, model, "
+                "extraction_version, request_count, submitted_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [batch_id, provider, purpose, model, version, request_count,
+                 naive_utc(submitted_at), json.dumps(payload)],
+            )
+
+    def get_open_batches(self) -> list[dict[str, Any]]:
+        """All in-flight batches (a row exists only until it's reconciled)."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT batch_id, provider, purpose, model, extraction_version, "
+                "request_count, submitted_at, payload FROM llm_batches "
+                "ORDER BY submitted_at"
+            ).fetchall()
+        return [
+            {
+                "batch_id": r[0],
+                "provider": r[1],
+                "purpose": r[2],
+                "model": r[3],
+                "extraction_version": r[4],
+                "request_count": r[5],
+                "submitted_at": r[6],
+                "payload": json.loads(r[7]) if r[7] else {},
+            }
+            for r in rows
+        ]
+
+    def delete_batch(self, batch_id: str) -> None:
+        """Drop a batch row once its results have been written (reconciled)."""
+        with self._lock:
+            self._con.execute("DELETE FROM llm_batches WHERE batch_id = ?", [batch_id])
+
+    def get_inflight_semantics_markets(self) -> set[str]:
+        """market_ids currently covered by an open ``semantics`` batch — excluded
+        from re-selection so a bulk backfill isn't submitted twice."""
+        out: set[str] = set()
+        for b in self.get_open_batches():
+            if b["purpose"] == "semantics":
+                out.update(str(v) for v in b["payload"].values())
+        return out
+
+    def get_inflight_pairs(self) -> set[tuple[str, str]]:
+        """Canonical (a, b) pairs currently covered by an open pair batch (primary
+        or verify) — excluded from re-selection so an in-flight pair isn't
+        re-submitted while its batch is still draining."""
+        out: set[tuple[str, str]] = set()
+        for b in self.get_open_batches():
+            if b["purpose"] == "pair_primary":
+                for v in b["payload"].values():
+                    out.add((v[0], v[1]))
+            elif b["purpose"] == "pair_verify":
+                for v in b["payload"].values():
+                    pair = v["pair"]
+                    out.add((pair[0], pair[1]))
+        return out
 
     # -- snapshot-builder queries ------------------------------------------
 

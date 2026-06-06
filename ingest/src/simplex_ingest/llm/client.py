@@ -1,4 +1,4 @@
-"""OpenRouter LLM client for the extraction layer.
+"""OpenRouter LLM client for the extraction layer (the synchronous spend path).
 
 Two call shapes, both returning validated dataclasses:
 
@@ -10,6 +10,13 @@ The transport is OpenRouter's OpenAI-compatible ``/chat/completions`` (Anthropic
 models are reached via a ``anthropic/...`` model id, kept in ``constants.py`` so
 it's swappable). The client is rate-limited by a shared :class:`TokenBucket` and
 retries 429/5xx with jittered backoff, mirroring :mod:`kalshi.rest`.
+
+The **message building** (system + user prompts) and **response parsing** are
+module-level functions (``build_extract_messages`` / ``build_classify_messages`` /
+``parse_semantics`` / ``parse_classification``) rather than methods, so the
+asynchronous Anthropic batch path (:mod:`..llm.batch`) constructs *byte-identical*
+requests and parses results the same way — one prompt+schema definition, two
+transports.
 
 **Failure discipline.** Every failure path — transport error, non-2xx after
 retries, unparseable body, schema/enum violation — is funneled into a single
@@ -49,6 +56,13 @@ RELATIONSHIP_TYPES = frozenset(
 # "second" refer to the order the markets are presented to the model; the loop
 # presents them in canonical (a < b) order, so first==a, second==b.
 DIRECTIONS = frozenset({"first_implies_second", "second_implies_first", "symmetric", "none"})
+
+# Call-purpose tags. Threaded into usage logging (cost attribution by stage) and
+# used by the loop/batch layer to route work. Stable strings — they appear in the
+# structured logs the deploy verification greps.
+PURPOSE_SEMANTICS = "stage_a"
+PURPOSE_PAIR_PRIMARY = "pair_primary"
+PURPOSE_PAIR_VERIFY = "pair_verify"
 
 
 class LLMError(Exception):
@@ -125,6 +139,118 @@ def _market_block(label: str, m: dict) -> str:
     )
 
 
+def build_extract_messages(
+    *, title: str | None, description: str | None, resolution_criteria: str | None
+) -> tuple[str, str]:
+    """(system, user) for a Stage A semantics extraction. Shared by both paths."""
+    user = (
+        f"Title: {title or '—'}\n\n"
+        f"Description / rules:\n{description or '—'}\n\n"
+        f"Resolution criteria:\n{resolution_criteria or '—'}"
+    )
+    return _EXTRACT_SYSTEM, user
+
+
+def build_classify_messages(*, market_a: dict, market_b: dict) -> tuple[str, str]:
+    """(system, user) for a Stage B pair classification. Shared by both paths."""
+    user = (
+        _market_block("FIRST", market_a)
+        + "\n"
+        + _market_block("SECOND", market_b)
+        + "\nClassify the relationship from FIRST to SECOND."
+    )
+    return _CLASSIFY_SYSTEM, user
+
+
+# -- parsing ----------------------------------------------------------------
+
+
+def _parse_object(content: str) -> dict:
+    """Parse the model's JSON object, tolerating ```json fences."""
+    s = content.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1] if "\n" in s else s
+        s = s.removeprefix("json").strip()
+        if s.endswith("```"):
+            s = s[: s.rfind("```")]
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"response was not valid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise LLMError("response JSON was not an object")
+    return obj
+
+
+def _as_str_list(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise LLMError("expected a JSON array")
+    return tuple(str(v).strip() for v in value if str(v).strip())
+
+
+def parse_semantics(content: str) -> MarketSemantics:
+    """Validate a Stage A completion into MarketSemantics. Shared by both paths."""
+    obj = _parse_object(content)
+    try:
+        return MarketSemantics(
+            underlying_event=str(obj["underlying_event"]),
+            resolves_yes_when=str(obj["resolves_yes_when"]),
+            resolves_no_when=str(obj["resolves_no_when"]),
+            resolution_timing=str(obj["resolution_timing"]),
+            entities=_as_str_list(obj.get("entities")),
+            dependencies=_as_str_list(obj.get("dependencies")),
+        )
+    except KeyError as exc:
+        raise LLMError(f"semantics missing required key: {exc}") from exc
+
+
+def parse_classification(content: str) -> PairClassification:
+    """Validate a Stage B completion into PairClassification. Shared by both paths."""
+    obj = _parse_object(content)
+    rel = str(obj.get("relationship_type", "")).strip()
+    if rel not in RELATIONSHIP_TYPES:
+        raise LLMError(f"unknown relationship_type {rel!r}")
+    direction = str(obj.get("direction", "none")).strip() or "none"
+    if direction not in DIRECTIONS:
+        raise LLMError(f"unknown direction {direction!r}")
+    try:
+        confidence = float(obj.get("confidence"))
+    except (TypeError, ValueError) as exc:
+        raise LLMError(f"confidence not numeric: {exc}") from exc
+    confidence = max(0.0, min(1.0, confidence))
+    return PairClassification(
+        relationship_type=rel,
+        direction=direction,
+        confidence=confidence,
+        rationale=str(obj.get("rationale", "")),
+    )
+
+
+def log_usage(*, mode: str, purpose: str, model: str, usage: dict | None) -> None:
+    """Emit one structured cost-attribution line for an LLM call.
+
+    ``usage`` is the provider's token block (OpenAI-compatible ``prompt_tokens`` /
+    ``completion_tokens`` for OpenRouter, ``input_tokens`` / ``output_tokens`` for
+    Anthropic). Tagged by ``mode`` (sync|batch), ``purpose`` (stage_a|pair_primary|
+    pair_verify) and ``model`` so spend can be summed per stage — the number that
+    decides batch go/no-go. Greppable phrase: ``llm usage``."""
+    usage = usage or {}
+    inp = usage.get("prompt_tokens", usage.get("input_tokens"))
+    out = usage.get("completion_tokens", usage.get("output_tokens"))
+    log.info(
+        "llm usage",
+        extra={
+            "mode": mode,
+            "purpose": purpose,
+            "model": model,
+            "input_tokens": inp,
+            "output_tokens": out,
+        },
+    )
+
+
 class OpenRouterClient:
     def __init__(
         self,
@@ -152,8 +278,11 @@ class OpenRouterClient:
 
     # -- transport ----------------------------------------------------------
 
-    async def _chat(self, model: str, system: str, user: str) -> tuple[str, dict]:
-        """One chat completion. Returns (content, raw_json). Raises LLMError."""
+    async def _chat(self, model: str, system: str, user: str, *, purpose: str) -> str:
+        """One chat completion. Returns the content string. Raises LLMError.
+
+        Logs the response's usage block (tagged by ``purpose`` + ``model``) for
+        cost attribution — the block OpenRouter returns and we otherwise discard."""
         url = f"{self._base}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -203,85 +332,27 @@ class OpenRouterClient:
                 content = data["choices"][0]["message"]["content"]
             except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
                 raise LLMError(f"malformed completion envelope: {exc}") from exc
-            return content, data
-
-    @staticmethod
-    def _parse_object(content: str) -> dict:
-        """Parse the model's JSON object, tolerating ```json fences."""
-        s = content.strip()
-        if s.startswith("```"):
-            s = s.split("\n", 1)[-1] if "\n" in s else s
-            s = s.removeprefix("json").strip()
-            if s.endswith("```"):
-                s = s[: s.rfind("```")]
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError as exc:
-            raise LLMError(f"response was not valid JSON: {exc}") from exc
-        if not isinstance(obj, dict):
-            raise LLMError("response JSON was not an object")
-        return obj
-
-    @staticmethod
-    def _as_str_list(value: object) -> tuple[str, ...]:
-        if value is None:
-            return ()
-        if not isinstance(value, list):
-            raise LLMError("expected a JSON array")
-        return tuple(str(v).strip() for v in value if str(v).strip())
+            log_usage(mode="sync", purpose=purpose, model=model, usage=data.get("usage"))
+            return content
 
     # -- Stage A ------------------------------------------------------------
 
     async def extract_market(
         self, model: str, *, title: str | None, description: str | None,
-        resolution_criteria: str | None,
+        resolution_criteria: str | None, purpose: str = PURPOSE_SEMANTICS,
     ) -> MarketSemantics:
-        user = (
-            f"Title: {title or '—'}\n\n"
-            f"Description / rules:\n{description or '—'}\n\n"
-            f"Resolution criteria:\n{resolution_criteria or '—'}"
+        system, user = build_extract_messages(
+            title=title, description=description, resolution_criteria=resolution_criteria
         )
-        content, _ = await self._chat(model, _EXTRACT_SYSTEM, user)
-        obj = self._parse_object(content)
-        try:
-            return MarketSemantics(
-                underlying_event=str(obj["underlying_event"]),
-                resolves_yes_when=str(obj["resolves_yes_when"]),
-                resolves_no_when=str(obj["resolves_no_when"]),
-                resolution_timing=str(obj["resolution_timing"]),
-                entities=self._as_str_list(obj.get("entities")),
-                dependencies=self._as_str_list(obj.get("dependencies")),
-            )
-        except KeyError as exc:
-            raise LLMError(f"semantics missing required key: {exc}") from exc
+        content = await self._chat(model, system, user, purpose=purpose)
+        return parse_semantics(content)
 
     # -- Stage B ------------------------------------------------------------
 
     async def classify_pair(
-        self, model: str, *, market_a: dict, market_b: dict
+        self, model: str, *, market_a: dict, market_b: dict,
+        purpose: str = PURPOSE_PAIR_PRIMARY,
     ) -> PairClassification:
-        user = (
-            _market_block("FIRST", market_a)
-            + "\n"
-            + _market_block("SECOND", market_b)
-            + "\nClassify the relationship from FIRST to SECOND."
-        )
-        content, _ = await self._chat(model, _CLASSIFY_SYSTEM, user)
-        obj = self._parse_object(content)
-        rel = str(obj.get("relationship_type", "")).strip()
-        if rel not in RELATIONSHIP_TYPES:
-            raise LLMError(f"unknown relationship_type {rel!r}")
-        direction = str(obj.get("direction", "none")).strip() or "none"
-        if direction not in DIRECTIONS:
-            raise LLMError(f"unknown direction {direction!r}")
-        try:
-            confidence = float(obj.get("confidence"))
-        except (TypeError, ValueError) as exc:
-            raise LLMError(f"confidence not numeric: {exc}") from exc
-        confidence = max(0.0, min(1.0, confidence))
-        return PairClassification(
-            relationship_type=rel,
-            direction=direction,
-            confidence=confidence,
-            rationale=str(obj.get("rationale", "")),
-        )
+        system, user = build_classify_messages(market_a=market_a, market_b=market_b)
+        content = await self._chat(model, system, user, purpose=purpose)
+        return parse_classification(content)

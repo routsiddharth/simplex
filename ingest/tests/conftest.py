@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from simplex_ingest.db import Database
 from simplex_ingest.discovery_predicates import EventStats, SeriesStats
 from simplex_ingest.kalshi.auth import KalshiSigner
-from simplex_ingest.llm import LLMError, MarketSemantics, PairClassification
+from simplex_ingest.llm import BatchResult, LLMError, MarketSemantics, PairClassification
 from simplex_ingest.runtime import Heartbeats
 
 
@@ -269,11 +269,12 @@ def make_signer(rsa_key):
 def make_runtime():
     """A SimpleNamespace runtime carrying just what the loops under test touch."""
 
-    def _make(db, rest=None, llm=None):
+    def _make(db, rest=None, llm=None, batch=None):
         return SimpleNamespace(
             db=db,
             rest=rest,
             llm=llm,
+            batch=batch,
             shutdown=asyncio.Event(),
             heartbeats=Heartbeats(),
         )
@@ -316,13 +317,14 @@ class FakeLLMClient:
         self.extract_calls: list[str] = []
         self.classify_calls: list[tuple] = []
 
-    async def extract_market(self, model, *, title, description, resolution_criteria):
+    async def extract_market(self, model, *, title, description, resolution_criteria,
+                             purpose="stage_a"):
         self.extract_calls.append(title)
         if title in self.raise_titles:
             raise LLMError("forced extract failure")
         return self.semantics.get(title, _DEFAULT_SEMANTICS)
 
-    async def classify_pair(self, model, *, market_a, market_b):
+    async def classify_pair(self, model, *, market_a, market_b, purpose="pair_primary"):
         a, b = market_a["market_id"], market_b["market_id"]
         self.classify_calls.append((a, b, model))
         if (a, b) in self.raise_pairs:
@@ -343,6 +345,66 @@ def make_fake_llm():
             semantics=semantics, classifications=classifications,
             raise_titles=raise_titles, raise_pairs=raise_pairs,
         )
+
+    return _make
+
+
+# -- fake Anthropic batch client (for the extraction loop's async path) ------
+
+class FakeBatchClient:
+    """In-memory stand-in for AnthropicBatchClient — no network.
+
+    ``submit`` records the requests and hands back a deterministic batch id; a
+    submitted batch reports ``ended`` by default. A test inspects the submission
+    (and the DB-persisted payload) to learn the custom_id → work mapping, then
+    feeds results back with :meth:`set_results` before driving reconciliation.
+    """
+
+    def __init__(self):
+        self.submitted: list[dict] = []        # [{batch_id, requests}]
+        self._status: dict[str, str] = {}       # batch_id -> processing_status
+        self._results: dict[str, list] = {}     # batch_id -> [BatchResult]
+        self._counter = 0
+        self.fail_submit = False
+
+    async def submit(self, requests):
+        if self.fail_submit:
+            raise LLMError("forced submit failure")
+        self._counter += 1
+        bid = f"batch-{self._counter}"
+        self.submitted.append({"batch_id": bid, "requests": list(requests)})
+        return bid
+
+    async def poll(self, batch_id):
+        return {"processing_status": self._status.get(batch_id, "ended")}
+
+    async def results(self, batch_id):
+        return self._results.get(batch_id, [])
+
+    def set_status(self, batch_id, status):
+        self._status[batch_id] = status
+
+    def set_results(self, batch_id, results):
+        self._results[batch_id] = list(results)
+
+    async def aclose(self):
+        pass
+
+
+@pytest.fixture
+def make_fake_batch():
+    def _make():
+        return FakeBatchClient()
+
+    return _make
+
+
+@pytest.fixture
+def make_batch_result():
+    """Build a BatchResult: succeeded (content set) or failed (error set)."""
+
+    def _make(custom_id, *, content=None, usage=None, error=None):
+        return BatchResult(custom_id=custom_id, content=content, usage=usage, error=error)
 
     return _make
 

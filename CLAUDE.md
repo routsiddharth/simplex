@@ -48,8 +48,9 @@ market resolution against Kalshi to drop the graph of resolved markets), **catal
 **websocket** (persistent — orderbook/trade/lifecycle → `raw_events`),
 **snapshot** (10 s — replays `raw_events` → `snapshots` grid + book checkpoints),
 **audit** (hourly — in-memory book vs REST reconciliation), **extraction** (5 min
-— catalog markets → `market_semantics` + trust-tiered `market_edges` via an LLM;
-soft-fails/idles without `OPENROUTER_API_KEY`).
+— catalog markets → `market_semantics` + trust-tiered `market_edges` via an LLM,
+spend-shaped by a time-to-resolution gate + an optional discounted Anthropic
+Message Batches path; soft-fails/idles without `OPENROUTER_API_KEY`).
 
 ## Run / test / inspect
 
@@ -57,11 +58,12 @@ soft-fails/idles without `OPENROUTER_API_KEY`).
 cd ingest                                  # the service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
-cp .env.example .env                       # 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
+cp .env.example .env                       # 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY + ANTHROPIC_API_KEY optional
 python -m simplex_ingest                   # run the ingest; GET :8080/health
-pytest                                     # 188 hermetic tests (units: predicates, candidates,
-                                           #   orderbook, reconstruct, fixedpoint, auth/REST/LLM
-                                           #   clients, supervisor, health, DB; loops + full
+pytest                                     # 226 hermetic tests (units: predicates, candidates,
+                                           #   spend gate, orderbook, reconstruct, fixedpoint,
+                                           #   auth/REST/LLM/batch clients, supervisor, health, DB;
+                                           #   loops incl. batch routing/reconcile + full
                                            #   end-to-end pipeline over a local WS server)
 pytest --run-live                          # + 4 opt-in live smoke tests vs the Railway deploy
 python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
@@ -89,11 +91,12 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
    (Postgres for OLTP) — see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §11.
 3. **Discovery owns the tracked set** — no manual allowlist; predicates rule;
    never wipe the working set on a transient empty sweep or REST error.
-4. **Behavior is configured in `constants.py`, not env.** Five values come from
-   `.env` (`config.py`): the four Kalshi/deploy values + the optional secret
-   `OPENROUTER_API_KEY` (the one allowed exception — a secret can't be a constant;
-   it enables Stage 3). Everything else, incl. LLM model ids / thresholds, is a
-   constant. Don't add env knobs.
+4. **Behavior is configured in `constants.py`, not env.** Six values come from
+   `.env` (`config.py`): the four Kalshi/deploy values + two optional secrets,
+   `OPENROUTER_API_KEY` (enables Stage 3, sync path) and `ANTHROPIC_API_KEY` (adds
+   the discounted batch path) — the allowed exceptions, since a secret can't be a
+   constant. Everything else, incl. LLM model ids (sync *and* batch) / thresholds /
+   gate cutoffs, is a constant. Don't add env knobs.
 5. **No secrets in the image** (`ingest/.dockerignore` excludes `.env`/`*.pem`).
 6. **Subscribers must not raise on malformed input** — log and drop.
 7. **DuckDB `TIMESTAMP` is naive UTC** — normalize with `util.naive_utc`.

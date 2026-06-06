@@ -1,12 +1,14 @@
-"""Environment-driven configuration (the five-value surface).
+"""Environment-driven configuration (the secrets/deploy surface).
 
 Only secrets and deployment-specific values come from the environment / .env.
 Everything tunable lives in :mod:`simplex_ingest.constants`.
 
-The four ingest values are required; ``OPENROUTER_API_KEY`` is the fifth, and the
-one *optional* one — it is a secret (so it can't be a constant) that unlocks the
-Stage-3 extraction layer. Absent it, the extraction loop soft-fails (idles) and
-plain ingest runs unchanged.
+The four ingest values are required. Two *optional* secrets follow (secrets can't
+be constants): ``OPENROUTER_API_KEY`` unlocks the Stage-3 extraction layer
+(synchronous path) — absent it, the extraction loop soft-fails (idles) and plain
+ingest runs unchanged; ``ANTHROPIC_API_KEY`` additionally unlocks the discounted
+Anthropic Message Batches spend path — absent it, batch-routed work degrades to the
+synchronous OpenRouter path.
 """
 
 from __future__ import annotations
@@ -88,8 +90,13 @@ class Settings(BaseSettings):
     kalshi_api_secret: str = Field(..., alias="KALSHI_API_SECRET")
     kalshi_env: str = Field("demo", alias="KALSHI_ENV")
     simplex_data_dir: Path = Field(Path("./data"), alias="SIMPLEX_DATA_DIR")
-    # Optional: enables the Stage-3 extraction layer. Empty => loop idles.
+    # Optional: enables the Stage-3 extraction layer (synchronous OpenRouter path).
+    # Empty => loop idles.
     openrouter_api_key: str = Field("", alias="OPENROUTER_API_KEY")
+    # Optional: enables the Anthropic-direct Message Batches spend path (the 50%-off
+    # async route for non-latency-sensitive extraction). Empty => batch-routed work
+    # degrades to the synchronous OpenRouter path. Independent of the OpenRouter key.
+    anthropic_api_key: str = Field("", alias="ANTHROPIC_API_KEY")
 
     # -- derived ------------------------------------------------------------
 

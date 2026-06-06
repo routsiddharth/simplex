@@ -77,14 +77,15 @@ future solver in-process (see §11).
         └──────────────────────────┘       │  checkpoints book_state     │
                                             └────────────────────────────┘
 
-   OpenRouter (LLM)          markets catalog
-        │                         │
-  ┌─────▼─────────────────────────▼──────────┐
-  │ extraction (5 min)                        │
-  │ A: market → market_semantics (cached)     │
-  │ B: candidate pairs → classify → trust tier│
-  │    → market_edges (trusted/soft/review)   │
-  └───────────────────────────────────────────┘
+   OpenRouter (sync) / Anthropic Batches (async)   markets catalog
+        │                                                │
+  ┌─────▼────────────────────────────────────────────── ▼──────────┐
+  │ extraction (5 min)                                              │
+  │ reconcile: poll open llm_batches → write results               │
+  │ A: market → market_semantics (cached; bulk → batch)            │
+  │ B: candidate pairs → time gate (skip/sync/batch) → classify    │
+  │    → trust tier → market_edges (trusted/soft/review)           │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 A `supervisor` runs each loop's `run()` forever; a crash is logged and the loop
@@ -213,10 +214,11 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   right levels at wrong sizes) that the structural test alone cannot see.
 
 ### Extraction (`loops/extraction.py`) — the LLM semantic + edge layer (Stage 3)
-- **Cadence:** every `EXTRACTION_INTERVAL_SECONDS` (5 min). Both phases are
-  idempotent no-ops when there's no new work, so the cadence costs nothing on a
-  quiet catalog. Bounded per cycle by `EXTRACTION_BATCH_SIZE` (50); a backlog
-  drains across cycles.
+- **Cadence:** every `EXTRACTION_INTERVAL_SECONDS` (5 min). Each cycle runs three
+  phases — **reconcile** (drain finished async batches), **Phase A** (semantics),
+  **Phase B** (edges) — all idempotent no-ops when there's no new work, so the
+  cadence costs nothing on a quiet catalog. The synchronous work is bounded per
+  cycle by `EXTRACTION_BATCH_SIZE` (50); a backlog drains across cycles.
 - **Reasoning belongs at pair time, not extraction time.** Phase A makes each
   market *rich* (a comparison-ready semantic record); Phase B does the logical
   comparison **by model**, not by code — comparison-by-code is brittle across a
@@ -231,12 +233,13 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 - **Phase B — pairwise typed edges.** Candidate pairs are picked **cheaply** by
   `pair_candidates.py` (a pure module: same `event_ticker` OR same
   `series_ticker` OR ≥ `PAIR_ENTITY_OVERLAP_MIN` shared entities) so Stage B never
-  classifies all O(n²) pairs. Each candidate goes to `PAIR_MODEL` (an Opus tier —
-  the hard reasoning, low volume), which returns one of seven relationship types
-  — `same_event`, `implies`, `mutually_exclusive`, `partition_member`,
-  `conditional`, `correlated`, `unrelated` — a direction (for the asymmetric
-  ones), a confidence, and a rationale. An unknown label is rejected (`LLMError`),
-  never coerced into the graph.
+  classifies all O(n²) pairs. Each surviving candidate (after the spend gate
+  below) goes to `PAIR_MODEL` (a **Sonnet** tier — see "spend discipline"), which
+  returns one of seven relationship types — `same_event`, `implies`,
+  `mutually_exclusive`, `partition_member`, `conditional`, `correlated`,
+  `unrelated` — a direction (for the asymmetric ones), a confidence, and a
+  rationale. An unknown label is rejected (`LLMError`), never coerced into the
+  graph.
 - **Trust gradient (why a bad edge is dangerous).** A wrong edge fed to the
   convex solver becomes a confident-looking but spurious "arbitrage," so edges
   enter at a tier matched to confidence:
@@ -245,19 +248,69 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     model (`PAIR_VERIFY_MODEL`, deliberately different from `PAIR_MODEL`) agrees
     on the relationship type. Agreement → `trusted` (`agreement_status='agreed'`);
     disagreement → `review`. The 2× spend lands only on this highest-blast-radius
-    band.
+    band — and it's the strongest (**Opus**) tier, since this one decision gates
+    the hard-constraint set.
   - `≥ EDGE_SOFT_CONFIDENCE` (0.6) → `soft` (a soft solver constraint).
   - below that → `review` (the manual-review queue: the query
     `trust_tier='review' AND review_status='pending'`).
+- **Spend discipline — model tiers, the time gate, and the batch seam.** Stage B
+  is the cost driver, so spend is shaped three ways (full rationale in
+  [`LLM-COST-MIGRATION.md`](./LLM-COST-MIGRATION.md)):
+  - **Tiering.** The primary pass is Sonnet (`PAIR_MODEL`), not Opus —
+    Opus-on-every-pair was the biggest line item. Opus (`PAIR_VERIFY_MODEL`) is
+    spent *only* as the independent verifier on the ≥0.85 band. Stage A semantics
+    stay on Sonnet (`EXTRACTION_MODEL`).
+  - **Time-to-resolution gate (`pair_candidates.route_pair`).** An edge's useful
+    life is `min(life of A, life of B)` — it dies when *either* endpoint settles
+    (the graph is pruned 1h after resolution). So each candidate is gated on
+    `remaining_life` (from `markets.closes_at`, carried through
+    `get_active_markets_with_semantics`): `< EDGE_REMAINING_LIFE_FLOOR_SECONDS`
+    (24h) → **skip** (negative-ROI, never spend); `< EDGE_BATCH_THRESHOLD_SECONDS`
+    (48h) → **sync**; `≥` → **batch**. Unknown close time → sync (never silently
+    skip).
+  - **Two transports, one prompt set.** Latency-insensitive work (long-horizon
+    pairs; a *bulk* Phase-A backfill ≥ `BATCH_BULK_SEMANTICS_THRESHOLD`) goes to
+    the **Anthropic Message Batches** path (`llm/batch.py`, flat 50% off,
+    ~1h–24h). Short-fuse / steady-state work stays on the synchronous OpenRouter
+    path (`llm/client.py`). Both share the message builders + result parsers in
+    `llm/`, so a batched request is byte-identical to its sync twin. **A pair's
+    primary and verify always travel the same transport** (a batched primary's
+    verify is itself batched, joining the next wave). The two providers use
+    **different model-id spellings** — OpenRouter dotted (`anthropic/claude-…`),
+    Anthropic dashed (`claude-…`); the `BATCH_*` model constants mirror the sync
+    ones. The batch path is **optional**: with no `ANTHROPIC_API_KEY`, batch-routed
+    work degrades to sync (still produced, at full price).
+- **Batch state machine (submit-now / retrieve-later).** A batch crosses cycles:
+  cycle *N* submits and persists `(batch_id, purpose, the work it covers, prompt
+  version)` to the durable `llm_batches` table; a later cycle's **reconcile** phase
+  polls each open batch and, once it has *ended*, writes its results (semantics /
+  edges) and deletes the row. In-flight markets/pairs are excluded from
+  re-selection (`get_inflight_*`) so nothing is double-submitted. Persisting the id
+  is essential — a restart would otherwise orphan a submitted batch (Anthropic
+  keeps results 29 days, so a persisted id is recoverable). **Orphan backstop:** the
+  only two deletion paths are "results written" and "abandoned past
+  `BATCH_MAX_AGE_SECONDS` (48h)", so a row can never outlive its batch and silently
+  strand its covered items — a wedged batch or a terminally-failing poll/results
+  (e.g. a purged/404'd id) is dropped once stale and its items re-spend (at-least-
+  once, never silent loss). Single-writer DuckDB is unaffected: batch retrieval
+  writes from the same process as the sync path.
+- **Cost attribution.** Every call (sync or batch) logs an `llm usage` line tagged
+  by `mode` (sync|batch), `purpose` (stage_a|pair_primary|pair_verify) and model,
+  so spend can be summed per stage — the number that justifies (or doesn't) the
+  batch path.
 - **Outputs are durable, non-regenerable artifacts** (§5, §9) — never wiped on
   re-run; a re-classification updates the edge but **never** clobbers a human
   review decision (`review_status`/`reviewed_*` are left untouched on conflict).
 - **Soft-fails without a key.** No `OPENROUTER_API_KEY` → `rt.llm is None` → the
-  cycle is a logged no-op and plain ingest runs unchanged. **One bad item never
-  sinks a pass:** the client raises `LLMError` on any transport/parse/schema
-  failure and the loop logs-and-skips that single market or pair.
+  cycle is a logged no-op and plain ingest runs unchanged (`ANTHROPIC_API_KEY`
+  alone does not enable extraction — it only adds the batch transport on top of the
+  OpenRouter base). **One bad item never sinks a pass:** the clients raise
+  `LLMError` on any transport/parse/schema failure (and a single failed *batch*
+  request surfaces as a skippable per-item error) — the loop logs-and-skips that
+  single market or pair.
 - Dry-run inspector (DB read-only, no model calls, no spend; ingest must be
-  stopped): `python -m simplex_ingest.loops.extraction`.
+  stopped): `python -m simplex_ingest.loops.extraction` — prints the work plan
+  incl. the gate breakdown (skip/sync/batch) and in-flight batch count.
 
 ---
 
@@ -306,6 +359,7 @@ lock; `raw_events` writes are buffered and flushed in batches.
 | `audit_results` | Per-market book-vs-REST reconciliation outcomes. | `no_diff`/`small_diff`/`large_diff`/`error`; `action_taken` none/`book_reset`. |
 | `market_semantics` | **Stage-3 per-market semantic cache (LLM-derived).** | PK `market_id`. Cached forever; re-extracted only when `extraction_version` bumps. `entities`/`dependencies` are JSON arrays. **Non-regenerable** (see below). |
 | `market_edges` | **Stage-3 pairwise typed relationship graph (LLM-derived).** | PK `(platform, market_id_a, market_id_b)`, canonical `a < b`. `trust_tier` ∈ `trusted`/`soft`/`review`; `agreement_status`; review-queue columns. The review queue is the query `trust_tier='review' AND review_status='pending'` — no separate table. **Non-regenerable** (see below). |
+| `llm_batches` | **In-flight Anthropic Message Batches (Stage-3 async spend path).** | PK `batch_id`. Durable submit-now/retrieve-later state: `purpose` (semantics/pair_primary/pair_verify), `payload` (custom_id → market_id / pair / {pair, primary}), prompt version. A row exists only while the batch is open — deleted once its results are written. Persisting the id is what lets a restart recover a submitted batch. |
 
 **Two retention classes.** The time-series tables (`raw_events`, `snapshots`,
 `book_state`, `audit_results`) are a **rolling window**: the discovery loop prunes
@@ -390,17 +444,20 @@ venue-neutral (`platform` tag on every row).
 
 ## 8. Cross-cutting concerns
 
-- **Configuration split.** **Five** values come from the environment/`.env` —
+- **Configuration split.** **Six** values come from the environment/`.env` —
   four required (`KALSHI_API_KEY_ID`, `KALSHI_API_SECRET`, `KALSHI_ENV`,
-  `SIMPLEX_DATA_DIR`) plus one optional, **`OPENROUTER_API_KEY`** (see `config.py`,
-  `ingest/.env.example`). The LLM key joins the env surface because it is a
-  *secret* (it can't be a constant); it's the one bounded exception to "four
-  values," and the precedent the future trader's exchange-write secret reuses
-  (§11). **Everything else tunable** (intervals, depth band, audit thresholds,
-  rate limits, ports, reconnect bounds, predicate thresholds, **LLM model ids /
-  confidence cutoffs / entity-overlap threshold**, log level) stays a documented
-  constant in `constants.py`. No env lookups for behavior — edit a constant and
-  redeploy.
+  `SIMPLEX_DATA_DIR`) plus two optional, **`OPENROUTER_API_KEY`** (enables the
+  Stage-3 extraction layer, synchronous path) and **`ANTHROPIC_API_KEY`** (adds
+  the discounted Message Batches transport on top — absent it, batch-routed work
+  degrades to sync) (see `config.py`, `ingest/.env.example`). The LLM keys join the
+  env surface because they are *secrets* (they can't be constants); they're the
+  bounded exception to "four values," and the precedent the future trader's
+  exchange-write secret reuses (§11). **Everything else tunable** (intervals, depth
+  band, audit thresholds, rate limits, ports, reconnect bounds, predicate
+  thresholds, **LLM model ids (sync *and* batch) / confidence cutoffs /
+  entity-overlap threshold / the time-to-resolution gate thresholds / batch
+  max_tokens**, log level) stays a documented constant in `constants.py`. No env
+  lookups for behavior — edit a constant and redeploy.
 - **Rate limiting (`util.TokenBucket`).** General catalog/discovery REST:
   `REST_CALLS_PER_SECOND`/`REST_BURST` (8/8). Audit has its **own** bucket
   (`AUDIT_REST_*`, 4/4) so an audit pass can't starve the pollers. The extraction

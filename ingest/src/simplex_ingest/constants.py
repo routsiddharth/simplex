@@ -286,15 +286,21 @@ EXTRACTION_MODEL = "anthropic/claude-sonnet-4.6"
 so a fast/cheap reasoning tier fits. Confirm the exact slug against OpenRouter's
 model catalog at deploy time."""
 
-PAIR_MODEL = "anthropic/claude-opus-4.8"
-"""Stage B primary (pair relationship): harder reasoning, lower volume (only
-candidate pairs), so the strongest tier earns its cost here."""
+PAIR_MODEL = "anthropic/claude-sonnet-4.6"
+"""Stage B primary (pair relationship). Demoted from Opus to Sonnet in the LLM
+cost migration: Opus-on-every-candidate-pair was the single biggest line item,
+and Sonnet holds the taxonomy classification well enough that the strongest tier
+is better spent only on the trust gate (see PAIR_VERIFY_MODEL). This is the
+cost *rate* lever — it lands before any batch routing. (OpenRouter dotted id.)"""
 
-PAIR_VERIFY_MODEL = "anthropic/claude-sonnet-4.6"
+PAIR_VERIFY_MODEL = "anthropic/claude-opus-4.8"
 """Independent second opinion used ONLY to promote a high-confidence edge to the
 `trusted` (hard-constraint) tier. Deliberately a *different* model from
 PAIR_MODEL so agreement is genuine independence, not one model agreeing with
-itself. Disagreement demotes the edge to the manual-review queue."""
+itself. With Sonnet now the primary, Opus moves here: it guards exactly the
+highest-blast-radius decision (a wrong hard constraint) while running only on the
+low-volume ≥EDGE_TRUSTED_CONFIDENCE band, not every pair. Disagreement demotes
+the edge to the manual-review queue. (OpenRouter dotted id.)"""
 
 EXTRACTION_PROMPT_VERSION = 1
 """Cache key for both tables. Bump when the prompts/output schema change so the
@@ -340,6 +346,97 @@ EDGE_SOFT_CONFIDENCE = 0.6
 solver constraint). Below it, the model is too unsure to trust automatically →
 the `review` tier (manual-review queue). Disagreement on a trusted candidate also
 lands in `review`."""
+
+
+# --------------------------------------------------------------------------
+# Time-to-resolution spend gate (Stage B) — see docs/LLM-COST-MIGRATION.md §4
+# --------------------------------------------------------------------------
+# An edge's useful life is min(life of A, life of B): a relationship between two
+# live prices dies when either endpoint settles, and the graph is pruned 1h after
+# resolution (GRAPH_PRUNE_AFTER_RESOLVED_SECONDS). So LLM spend on a pair is an
+# investment amortized over the pair's *remaining* live life. The gate applies
+# that amortization at spend time:
+#   remaining_life < FLOOR            → don't spend at all (negative-ROI edge)
+#   FLOOR ≤ remaining_life < BATCH    → sync (pay full price to get it in time)
+#   remaining_life ≥ BATCH            → batch (latency irrelevant; take the 50% off)
+# remaining_life is computed from markets.closes_at (carried into the candidate
+# path). When neither endpoint's close time is known the pair is routed sync
+# (conservative: never silently skip a possibly-useful edge on missing data).
+
+EDGE_REMAINING_LIFE_FLOOR_SECONDS = 86400
+"""24 h. Below this remaining life (nearer of the two endpoints) a candidate pair
+is not classified at all — the edge can't outlive its payback window, so it's
+negative-ROI regardless of how cheaply the call is bought. This floor is the part
+of the gate that bites even with no batch provider configured."""
+
+EDGE_BATCH_THRESHOLD_SECONDS = 172800
+"""48 h. At/above this remaining life a candidate pair is routed to the Anthropic
+batch path (flat 50% discount, ~1h–24h turnaround). Set comfortably above the
+worst-case batch turnaround so a batched edge still lands with ample life left.
+With no ANTHROPIC_API_KEY configured the batch route degrades to sync (the edge is
+still produced, just at full price)."""
+
+
+# --------------------------------------------------------------------------
+# Anthropic Message Batches — the asynchronous, discounted spend path (Stage 3)
+# --------------------------------------------------------------------------
+# Non-latency-sensitive extraction work (Stage A bulk backfill, long-horizon
+# Stage B pairs) is routed to the Anthropic Message Batches API: a flat 50% off
+# list price, results within ~1h–24h, retrievable for 29 days. This is a SECOND
+# provider seam distinct from OpenRouter — different host, different auth, and
+# crucially a DIFFERENT model-id spelling (Anthropic uses dashed ids; OpenRouter
+# uses dotted ids with an `anthropic/` prefix). Never cross the two. The seam is
+# optional: built only when ANTHROPIC_API_KEY is set (config.py); absent it, every
+# batch-routed item degrades to the synchronous OpenRouter path.
+
+ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+"""Anthropic-direct API root for the Message Batches endpoints. Not a secret (the
+API *key* is, and lives in the env per config.py)."""
+
+ANTHROPIC_VERSION = "2023-06-01"
+"""Value of the mandatory ``anthropic-version`` header on every Anthropic-direct
+request."""
+
+BATCH_MAX_TOKENS = 1500
+"""``max_tokens`` for batched Messages requests. This is a *mandatory* field on
+the Anthropic Messages/Batches API (the request is rejected without it) — not the
+cost-saving output cap discussed in the migration doc (which was deliberately not
+applied to the synchronous OpenRouter path). 1500 is generous headroom for the
+few-hundred-token semantics / classification JSON."""
+
+# Anthropic-direct (dashed) model ids. These mirror the OpenRouter (dotted) ids
+# above for the same logical tiers, but are spelled for the Anthropic API. Keep
+# them in lock-step with EXTRACTION_MODEL / PAIR_MODEL / PAIR_VERIFY_MODEL.
+BATCH_EXTRACTION_MODEL = "claude-sonnet-4-6"
+"""Stage A (semantics) on the batch path — mirrors EXTRACTION_MODEL."""
+
+BATCH_PAIR_MODEL = "claude-sonnet-4-6"
+"""Stage B primary on the batch path — mirrors PAIR_MODEL."""
+
+BATCH_PAIR_VERIFY_MODEL = "claude-opus-4-8"
+"""Stage B verify on the batch path — mirrors PAIR_VERIFY_MODEL."""
+
+BATCH_BULK_SEMANTICS_THRESHOLD = 100
+"""Stage A backlog size (markets missing current-version semantics) at/above which
+a cycle routes the whole backlog to the batch path instead of draining it
+synchronously. Steady-state trickle (a few newly-listed markets) stays sync —
+it's cheap, low-volume, and gates that market's Stage B; only a bulk event (first
+boot, an EXTRACTION_PROMPT_VERSION bump) is worth the submit/retrieve latency."""
+
+BATCH_SUBMIT_MAX_REQUESTS = 1000
+"""Upper bound on requests packed into a single batch submission per cycle. Far
+below Anthropic's per-batch ceiling (100k requests / 256MB); it just keeps any one
+submission bounded so a huge backlog drains over a few cycles rather than one
+giant batch."""
+
+BATCH_MAX_AGE_SECONDS = 172800
+"""48 h. Orphan backstop: an open `llm_batches` row older than this is dropped at
+reconcile and its items re-spend next cycle. Anthropic batches finish (or expire)
+within ~24 h, so a row still un-reconciled past this is wedged — a purged/404'd
+id, a permanently-stuck batch, or unfetchable results. Without this, a terminal
+poll/results error would orphan the row forever (its covered markets/pairs are
+excluded from re-selection while it's open), silently dropping them from the
+graph. At-least-once re-spend is the right trade vs. permanent loss."""
 
 
 # --------------------------------------------------------------------------

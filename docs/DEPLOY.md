@@ -92,7 +92,8 @@ in `constants.py`.
 | `KALSHI_API_SECRET` | RSA private key (PEM) | multi-line — see below |
 | `KALSHI_ENV` | `prod` or `demo` | selects hosts in `config.py` |
 | `SIMPLEX_DATA_DIR` | `/data` | **must** match the volume mount path |
-| `OPENROUTER_API_KEY` | OpenRouter key | **optional** — enables the Stage-3 LLM extraction layer; absent, that loop idles and plain ingest runs unchanged. The only secret beyond Kalshi; model ids/tuning are constants. |
+| `OPENROUTER_API_KEY` | OpenRouter key | **optional** — enables the Stage-3 LLM extraction layer (synchronous path); absent, that loop idles and plain ingest runs unchanged. Model ids/tuning are constants. |
+| `ANTHROPIC_API_KEY` | Anthropic key | **optional** — adds the discounted Anthropic **Message Batches** spend path on top of the OpenRouter layer (long-horizon edges + bulk semantics route there at ~50% off). Absent, batch-routed work degrades to the sync OpenRouter path. Does **not** enable extraction on its own — it augments `OPENROUTER_API_KEY`. |
 
 Plus, if your platform doesn't inject it: **`PORT=8080`** — the health server
 binds `$PORT` when present, else falls back to `HEALTH_PORT` (8080). Railway
@@ -231,9 +232,14 @@ Watch the logs and confirm, in order — this is the end-to-end cutover signatur
 4. `snapshots emitted` — `markets=M` within one `SNAPSHOT_INTERVAL`.
 5. **If `OPENROUTER_API_KEY` is set:** `semantics extracted` (per market), then
    `edge classified` (per pair), then `extraction cycle complete`
-   — `semantics=… edges=…` (within one `EXTRACTION_INTERVAL`, after the catalog
-   first populates markets). Without the key: `extraction layer disabled (loop
-   idles)` once, and the loop still heartbeats.
+   — `reconciled=… semantics=… edges=…` (within one `EXTRACTION_INTERVAL`, after
+   the catalog first populates markets). Each model call also emits an `llm usage`
+   line (tagged `mode`/`purpose`/`model`) for cost attribution. Without the key:
+   `extraction layer disabled (loop idles)` once, and the loop still heartbeats.
+   **If `ANTHROPIC_API_KEY` is also set**, long-horizon pairs / bulk semantics log
+   `batch submitted` and, a later cycle, `batch primary reconciled` /
+   `batch verify reconciled` / `batch semantics reconciled` (use the extraction
+   dry-run inspector to see the gate's skip/sync/batch split and in-flight count).
 6. `/health` → 200 with all six loops `true`; Railway marks the deploy SUCCESS.
 
 **Rotation (one-time sanity, ≥ 1 h):** after a discovery interval + one catalog

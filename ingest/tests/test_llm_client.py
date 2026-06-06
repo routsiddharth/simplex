@@ -9,6 +9,7 @@ LLMError; 429 retries. httpx MockTransport, no network; backoff patched fast.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -139,6 +140,32 @@ async def test_4xx_raises_llmerror():
     try:
         with pytest.raises(LLMError):
             await c.extract_market("m", title="t", description="d", resolution_criteria="r")
+    finally:
+        await c.aclose()
+
+
+async def test_usage_is_logged_tagged_by_purpose(caplog):
+    def handler(req):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(_SEM)}}],
+                "usage": {"prompt_tokens": 123, "completion_tokens": 45},
+            },
+        )
+
+    c = _client(handler)
+    try:
+        with caplog.at_level(logging.INFO):
+            await c.extract_market(
+                "anthropic/claude-sonnet-4.6", title="t", description="d",
+                resolution_criteria="r", purpose="stage_a",
+            )
+        rec = next(r for r in caplog.records if r.message == "llm usage")
+        assert rec.purpose == "stage_a"
+        assert rec.mode == "sync"
+        assert rec.input_tokens == 123
+        assert rec.output_tokens == 45
     finally:
         await c.aclose()
 

@@ -76,3 +76,42 @@ def test_reclassification_preserves_human_review_decision(tmp_db):
     edge = tmp_db.get_edges_for_pairs([("A", "B")])[("A", "B")]
     assert edge["trust_tier"] == "soft"          # classification updated
     assert edge["review_status"] == "approved"   # human decision preserved
+
+
+# -- llm_batches (async spend path, durable in-flight state) ----------------
+
+def _insert_batch(db, batch_id, purpose, payload, *, model="claude-sonnet-4-6"):
+    db.insert_batch(
+        batch_id, provider="anthropic", purpose=purpose, model=model,
+        version=V, request_count=len(payload), submitted_at=T0, payload=payload,
+    )
+
+
+def test_open_batches_roundtrip_and_delete(tmp_db):
+    _insert_batch(tmp_db, "b1", "semantics", {"r0": "M1", "r1": "M2"})
+    open_batches = tmp_db.get_open_batches()
+    assert len(open_batches) == 1
+    b = open_batches[0]
+    assert b["batch_id"] == "b1"
+    assert b["purpose"] == "semantics"
+    assert b["payload"] == {"r0": "M1", "r1": "M2"}
+    assert b["request_count"] == 2
+
+    tmp_db.delete_batch("b1")
+    assert tmp_db.get_open_batches() == []
+
+
+def test_inflight_semantics_markets(tmp_db):
+    _insert_batch(tmp_db, "b1", "semantics", {"r0": "M1", "r1": "M2"})
+    _insert_batch(tmp_db, "b2", "pair_primary", {"r0": ["A", "B"]})  # not semantics
+    assert tmp_db.get_inflight_semantics_markets() == {"M1", "M2"}
+
+
+def test_inflight_pairs_from_primary_and_verify(tmp_db):
+    _insert_batch(tmp_db, "b1", "pair_primary", {"r0": ["A", "B"], "r1": ["C", "D"]})
+    _insert_batch(
+        tmp_db, "b2", "pair_verify",
+        {"r0": {"pair": ["E", "F"], "primary": {"relationship_type": "implies"}}},
+    )
+    _insert_batch(tmp_db, "b3", "semantics", {"r0": "M1"})  # ignored for pairs
+    assert tmp_db.get_inflight_pairs() == {("A", "B"), ("C", "D"), ("E", "F")}
