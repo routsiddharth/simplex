@@ -14,12 +14,12 @@ and the next steps** — written to continue in a fresh session.
 |---|---|
 | **On `origin/main`** | `9529b6c` — everything below is pushed: Steps 1–4/6 + metrics (`0dae582`), audit-symmetry (`7a4be4a`), liquidity floor + bulk upsert (`64ea5f2`), cheap-model cost measure (`1044034`), docs (`9529b6c`). Working tree clean. |
 | **Tests** | `240 passed, 4 skipped` (live smoke skipped) |
-| **Live status (last measured ~21:58 UTC 06-06, on the `7a4be4a` build)** | **still flapping** (`reconnects` ~1/min, `keepalive ping timeout`); grid 30–80 s; `mean_sample_ms ≈ 25 000`. The floor+bulk fix (`64ea5f2`) had **not** deployed yet at that measurement. |
-| **Verdict** | The plan's root-cause (drain bursts → yields cure it) was **wrong**. The real bottleneck is the **per-tick snapshot DB write** at ~5.5 k markets. The floor+bulk change targets the *actual* cause; **awaiting the redeploy to confirm.** |
+| **Live status (re-measured ~22:43–22:46 UTC 06-06, on the deployed floor+bulk build)** | **snapshot fixed, WS still flaps.** `mean_sample_ms ≈ 1 800` (was ~25 000); grid clean **10 s**; `active=2907` (floor cut from 5 453); **zero `keepalive ping timeout`**. BUT `reconnects 18→22` over ~2.5 min ≈ **~1.5/min**, now closing with `ConnectionClosedError(None,None,None)` (no code), not keepalive. `reconciles=1` (incremental path now runs; was 0). |
+| **Verdict** | The snapshot-write root-cause was **correct** — floor+bulk killed the 25 s sampler, the 10 s grid, the market bloat, and the keepalive starvation. **But flapping is not gone:** with a *fast* sampler (loop unsaturated) the WS still drops ~1.5/min via a codeless `ConnectionClosedError`. Per §4/§5 decision tree this is the **Step 5 (WS sharding)** trigger — genuine per-connection throughput, not write saturation. Step 5's open knob (shard count `N`) is an **architect decision**; not built. |
 
-**Immediate next action:** let `origin/main` deploy, wait ~30–45 min, then
-re-measure `ws metrics reconnects` (should go flat) and `snapshot metrics
-mean_sample_ms` (should be < ~3 000).
+**Immediate next action:** decide Step 5 (WS sharding) — see §5 design + the open
+`N` knob. Everything the floor+bulk change targeted is confirmed fixed; the
+residual flap is a separate, per-connection cause.
 
 ---
 
@@ -211,6 +211,47 @@ throughput limits.
 The applier/sampler split + bulk-write + liquidity floor were added to
 `ARCHITECTURE.md` (snapshot builder + catalog + WS scaling note); the sharding
 design above is the WS "scaling note" §11 reservation.
+
+---
+
+## 7. Post-deploy verification (2026-06-06 ~22:43–22:46 UTC)
+
+Measured on the deployed floor+bulk build (`origin/main` past `64ea5f2`),
+~13–16 min after the SUCCESS deploy at 22:30 UTC. Two `ws metrics` / `snapshot
+metrics` rollups bracket the steady state.
+
+### 7a. What the fix fixed (all confirmed) ✅
+```
+snapshot metrics  mean_sample_ms 1826 → 1786   last 1690–2303   (was ~25 000)
+                  events_per_s 36–65   frames_per_s 68–110   active=2907  books=5453
+snapshots emitted 43:00→10→20→30→…→44:20  — clean 10 s grid     (was Δ 30–80 s)
+catalog/ws        active=2907, ws subscribes 2907               (was 5453; floor=100 cut ~47%)
+keepalive         ZERO `keepalive ping timeout` in either window (was ~11/7 min)
+```
+The snapshot-write hypothesis (§3) was right: the per-tick write was the cost,
+bulk upsert + floor collapsed it ~14×, the loop is no longer saturated, and the
+keepalive starvation it caused is gone.
+
+### 7b. What it did NOT fix ⚠️ — WS still flaps ~1.5/min
+```
+ws metrics   reconnects 18 (22:43:57) → 22 (22:46:30)  ≈ 1.5/min
+             reconciles=1  (incremental reconcile path now runs at least once; was 0)
+close reason ConnectionClosedError(None, None, None)   — no close code, NOT keepalive
+```
+The reconnect rate barely moved, but the **cause changed**: no longer keepalive
+starvation from a saturated loop (that's fixed), now a codeless connection close.
+With a fast sampler and an unsaturated loop, this is the §4 step-5 / §5 case:
+**genuine per-connection throughput / server-side drop**, re-anchoring every book
+on each drop (`resets` climbing, `ws initial subscribe` re-subscribes all 2907).
+
+### 7c. Recommendation
+Per §4 decision tree: floor+bulk were **sufficient for the snapshot/keepalive
+failure** (Steps 1–4/6 done), but the **residual flap → Step 5 (WS sharding)**.
+Step 5 is designed (§5) and gated on the architect picking shard count `N`
+(the one unspecified knob) — sized from the post-fix `frames_per_s` (now ~68–110
+on one connection). Not built pending that decision. Secondary: characterize the
+codeless close further (Kalshi idle-drop vs. throughput) before committing to N.
+
 
 ---
 
