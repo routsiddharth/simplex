@@ -124,12 +124,17 @@ class Database:
     # -- raw_events (buffered) ---------------------------------------------
 
     def buffer_event(self, ev: NormalizedEvent) -> int:
-        row = ev.as_row()
-        # Normalize timestamps to naive UTC for DuckDB.
+        # This module owns the raw_events column order: build the row from the
+        # event's named fields right next to _RAW_INSERT, so the two can't drift
+        # (timestamps normalized to naive UTC for DuckDB).
         row = (
-            naive_utc(row[0]) if row[0] else None,
-            naive_utc(row[1]),
-            *row[2:],
+            naive_utc(ev.ts) if ev.ts else None,
+            naive_utc(ev.received_ts),
+            ev.platform,
+            ev.market_id,
+            ev.event_type.value,
+            ev.sequence,
+            json.dumps(ev.payload, default=str),
         )
         with self._buffer_lock:
             self._buffer.append(row)

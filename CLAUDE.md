@@ -32,6 +32,13 @@ async loops, embedded DuckDB on a mounted volume. Downstream stages (solver,
 graph/viz, R2 export, LLM-in-the-loop trading) are planned — see
 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §1 and §11.
 
+The repo is a **monorepo**: the ingest service is self-contained under
+[`ingest/`](./ingest/) (its own `Dockerfile`, `pyproject.toml`, `src/`, `tests/`);
+`docs/`, `CLAUDE.md`, and `README.md` stay at the repo root. Future services
+(`solver` in-process first, then `trader`, `viz`) land as siblings — see
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §10–11. Run dev commands from
+`ingest/`.
+
 The five loops: **discovery** (hourly — self-manages the `tracked_series` set via
 predicates), **catalog** (5 min — tracked series → active market set),
 **websocket** (persistent — orderbook/trade/lifecycle → `raw_events`),
@@ -41,11 +48,12 @@ predicates), **catalog** (5 min — tracked series → active market set),
 ## Run / test / inspect
 
 ```bash
+cd ingest                                  # the service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env                       # four values; KALSHI_ENV=demo to start
 python -m simplex_ingest                   # run the ingest; GET :8080/health
-pytest                                     # 48 tests (predicates, DB, loops)
+pytest                                     # 116 tests (predicates, DB, loops, orderbook, reconstruct)
 python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
 ```
 
@@ -63,16 +71,16 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
    never wipe the working set on a transient empty sweep or REST error.
 4. **Behavior is configured in `constants.py`, not env.** Only four secrets/
    deploy values come from `.env` (`config.py`). Don't add env knobs.
-5. **No secrets in the image** (`.dockerignore` excludes `.env`/`*.pem`).
+5. **No secrets in the image** (`ingest/.dockerignore` excludes `.env`/`*.pem`).
 6. **Subscribers must not raise on malformed input** — log and drop.
 7. **DuckDB `TIMESTAMP` is naive UTC** — normalize with `util.naive_utc`.
 
 ## Conventions
 
-- **Loops** are classes with a `name` and async `run()`, supervised by
-  `supervisor.py`; each beats `rt.heartbeats` around idle sleeps and wakes early
-  on `rt.shutdown`. DB calls go through `asyncio.to_thread` (DuckDB is sync +
-  lock-serialized).
+- **Loops** are classes with a `name` and async `run()` (the `runtime.Loop`
+  Protocol), supervised by `supervisor.py`; each idles through `util.idle_sleep`
+  (periodic heartbeat + early wake on `rt.shutdown`). DB calls go through
+  `asyncio.to_thread` (DuckDB is sync + lock-serialized).
 - **Logging** is structured JSON to stdout: `log.info("msg", extra={...})`,
   tagged by `loop`. Keep messages greppable (the deploy verification relies on
   exact phrases like `catalog refreshed`, `ws reconciled`, `discovery cycle

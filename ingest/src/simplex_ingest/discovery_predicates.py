@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import constants as C
-from .util import market_volume
+from .kalshi.fixedpoint import volume as market_volume
 
 # Kalshi market statuses considered tradeable / eligible (mirrors catalog.py).
 TRADEABLE_STATUSES = frozenset({"active"})

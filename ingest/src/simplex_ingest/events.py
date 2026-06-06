@@ -4,7 +4,8 @@ A subscriber turns one raw inbound WS message into zero or more
 :class:`NormalizedEvent` objects. The ingest writes them verbatim to
 ``raw_events``; the normalized ``payload`` carries already-parsed numeric
 fields (dollars, contract counts) so downstream loops never re-parse exchange
-fixed-point strings.
+fixed-point strings. The mapping from these named fields to ``raw_events``
+columns lives in :mod:`simplex_ingest.db` — this module stays storage-agnostic.
 """
 
 from __future__ import annotations
@@ -38,17 +39,3 @@ class NormalizedEvent:
     payload: dict[str, Any]        # parsed, numeric where applicable
     ts: datetime | None = None     # exchange event time (UTC), if provided
     sequence: int | None = None    # exchange per-subscription seq
-
-    def as_row(self) -> tuple[Any, ...]:
-        """Column order matches the INSERT in :mod:`simplex_ingest.db`."""
-        import json
-
-        return (
-            self.ts,
-            self.received_ts,
-            self.platform,
-            self.market_id,
-            self.event_type.value,
-            self.sequence,
-            json.dumps(self.payload, default=str),
-        )

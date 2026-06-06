@@ -157,7 +157,7 @@ def test_p3_volume_summed_across_markets(make_event, make_market):
 
 
 def test_p3_volume_field_fallbacks(make_event):
-    # volume_fp missing -> volume -> volume_24h_fp, mirroring util.market_volume.
+    # volume_fp missing -> volume -> volume_24h_fp, mirroring kalshi.fixedpoint.volume.
     event = make_event(
         series="KXV",
         markets=[

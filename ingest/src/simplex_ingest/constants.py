@@ -106,6 +106,12 @@ RAW_EVENT_FLUSH_SECONDS = 1.0
 """Flush the raw_events buffer at least this often even if it hasn't filled, so
 the snapshot builder sees fresh events promptly and SIGTERM loses nothing."""
 
+RESET_REQUEST_QUEUE_MAXSIZE = 10000
+"""Bound on the book-reset request queue (snapshot/audit -> WS loop). Reset
+requests are per-market and drained every RAW_EVENT_FLUSH_SECONDS, so this is
+far above any real backlog; it exists only so a pathological producer can't grow
+the queue without bound (the put_nowait sites log and drop on QueueFull)."""
+
 
 # --------------------------------------------------------------------------
 # Order book / canaries
@@ -162,13 +168,26 @@ AUDIT_ORDERBOOK_DEPTH = 100
 """``depth`` param on GET /markets/{ticker}/orderbook during audits. Deep enough
 to compare full near-touch structure, not just top-of-book."""
 
-AUDIT_SMALL_DIFF_MAX_LEVELS = 2
-"""A book/REST diff touching at most this many price levels is classified
-'small' (info log, no action) rather than 'large'."""
+AUDIT_STRUCTURAL_DIFF_MAX_LEVELS = 4
+"""Audit classification is primarily *structural*: a price level present in one
+book but absent in the other (a level appeared or disappeared). The in-memory
+book is frozen ~100ms before the REST fetch, so small per-level *size* drift on
+levels present in both books is expected market movement, not corruption. A pass
+with at most this many structural mismatches across both sides AND no gross size
+drift (see ``AUDIT_SMALL_DIFF_MAX_SIZE_PCT``) is 'small' (info log, no action);
+otherwise the books genuinely disagree -> 'large': warn + forced book reset.
+Normal near-touch churn moves only a level or two in the freeze->REST window; a
+desynced book mismatches many."""
 
-AUDIT_SMALL_DIFF_MAX_SIZE_PCT = 5.0
-"""And whose largest per-level size delta is at most this percent. Above either
-threshold the diff is 'large': warn + forced book reset."""
+AUDIT_SMALL_DIFF_MAX_SIZE_PCT = 50.0
+"""Backstop size-drift ceiling. Even with few/no structural mismatches, a shared
+level whose size differs by more than this percentage (of the larger size)
+escalates the pass to 'large' -> book reset. This is the one independent check
+against a *magnitude* bug (e.g. a fixed-point/parse error that decodes the right
+levels at the wrong sizes), which the structural test alone cannot see. Set high
+deliberately: legitimate ~100ms freeze->REST drift on a level is small, while a
+decode/scale bug is off by integer factors (often >100%), so this catches gross
+corruption without re-triggering resets on ordinary market movement."""
 
 
 # --------------------------------------------------------------------------

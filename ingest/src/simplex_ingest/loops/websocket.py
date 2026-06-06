@@ -64,6 +64,10 @@ class WebSocketLoop:
                 log.warning("ws connection error", extra={"err": repr(exc)})
             if self.rt.shutdown.is_set():
                 break
+            # Beat before the (up to WS_RECONNECT_MAX_SECONDS) backoff sleep so a
+            # flapping/slow reconnect doesn't trip the health heartbeat timeout
+            # while we're disconnected and emitting no message-driven beats.
+            self.rt.heartbeats.beat(self.name)
             delay = await backoff.sleep()
             log.info("ws reconnecting", extra={"delay_s": round(delay, 2)})
 

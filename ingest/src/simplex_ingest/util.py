@@ -49,28 +49,34 @@ def parse_dt(value: object) -> datetime | None:
     return None
 
 
-def market_volume(market: dict) -> float:
-    """Best-effort contract volume for a Kalshi market.
-
-    Prefer the fixed-point ``volume_fp``, then plain ``volume``, then the 24h
-    fixed-point figure. Shared by the catalog poller (liquidity floor) and the
-    discovery predicates (P3 tradeability)."""
-    for key in ("volume_fp", "volume", "volume_24h_fp"):
-        v = market.get(key)
-        if v is not None:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                pass
-    return 0.0
-
-
 def floor_to_interval(dt: datetime, seconds: int) -> datetime:
     """Floor ``dt`` down to the nearest ``seconds`` grid boundary (naive UTC)."""
     dt = naive_utc(dt)
     epoch = datetime(1970, 1, 1)
     bucket = int((dt - epoch).total_seconds()) // seconds * seconds
     return epoch + timedelta(seconds=bucket)
+
+
+async def idle_sleep(
+    shutdown: asyncio.Event, heartbeats, name: str, seconds: float, *, step: float = 15.0
+) -> bool:
+    """Wait up to ``seconds``, waking immediately on shutdown and emitting a
+    heartbeat for ``name`` on each idle ``step``.
+
+    The single home for the "beat around idle sleeps" liveness convention every
+    loop must honor — so a loop can't silently drop heartbeats while idle and
+    trip the health timeout. Returns True if the full duration elapsed, False if
+    shutdown fired first."""
+    remaining = seconds
+    while remaining > 0 and not shutdown.is_set():
+        s = min(step, remaining)
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=s)
+            return False  # shutdown fired
+        except asyncio.TimeoutError:
+            heartbeats.beat(name)
+        remaining -= s
+    return not shutdown.is_set()
 
 
 class Backoff:

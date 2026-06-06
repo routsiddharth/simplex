@@ -23,7 +23,7 @@ import asyncio
 from .. import constants as C
 from ..discovery_predicates import aggregate, evaluate, rank_key
 from ..log import get_logger
-from ..util import naive_utc, now_utc
+from ..util import idle_sleep, naive_utc, now_utc
 
 log = get_logger("discovery")
 
@@ -43,7 +43,7 @@ class DiscoveryLoop:
         self.rt.heartbeats.beat(self.name)
 
         while not self.rt.shutdown.is_set():
-            await self._sleep(C.DISCOVERY_INTERVAL_SECONDS)
+            await idle_sleep(self.rt.shutdown, self.rt.heartbeats, self.name, C.DISCOVERY_INTERVAL_SECONDS)
             if self.rt.shutdown.is_set():
                 break
             try:
@@ -51,17 +51,6 @@ class DiscoveryLoop:
             except Exception:
                 log.exception("discovery cycle failed")
             self.rt.heartbeats.beat(self.name)
-
-    async def _sleep(self, seconds: float) -> None:
-        # Wake early on shutdown; heartbeat periodically while idle.
-        remaining = seconds
-        while remaining > 0 and not self.rt.shutdown.is_set():
-            step = min(15.0, remaining)
-            try:
-                await asyncio.wait_for(self.rt.shutdown.wait(), timeout=step)
-            except asyncio.TimeoutError:
-                self.rt.heartbeats.beat(self.name)
-            remaining -= step
 
     async def discover(self) -> None:
         events = await self.rt.rest.get_events(status="open", with_nested_markets=True)

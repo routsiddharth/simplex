@@ -33,8 +33,10 @@ It is built in stages. **Only Stage 1 (ingest) exists today.**
 | — | Other venues (Polymarket, Manifold) via the `BaseSubscriber` seam. | Planned |
 
 Everything downstream of the `snapshots` table is the coherence engine proper
-and is **not built**. Stage 1 exists to produce the clean, regular, gap-checked
-marginal time series the solver will consume.
+and is **not built**. Stage 1 exists to produce the regular, per-market
+gap-checked marginal time series the solver will consume — a 10 s grid that is
+contiguous while the process runs but **may have gaps across restarts** (the
+grid is forward-only; see §3), all fully regenerable from `raw_events`.
 
 ---
 
@@ -74,8 +76,11 @@ flush buffered `raw_events` → checkpoint books → close DB → exit 0.
 have emitted a heartbeat within `HEALTH_HEARTBEAT_TIMEOUT_SECONDS` (90 s).
 
 Code map: entry `app.py` (`run()` wires runtime, loops, signals, health,
-shutdown) / `__main__.py`. Shared state in `runtime.py` (`BookStore`,
-`Heartbeats`). Loop supervisor in `supervisor.py`. Loops in `loops/`.
+shutdown) / `__main__.py`. Shared state in `runtime.py` (`BookStore` of
+per-market `BookReconstructor`s, `Heartbeats`, the `request_reset` seam, the
+`Loop` Protocol). Per-market reconstruction in `reconstruct.py`. Loop supervisor
+in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
+`util.idle_sleep`.
 
 ---
 
@@ -120,17 +125,29 @@ shutdown) / `__main__.py`. Shared state in `runtime.py` (`BookStore`,
 
 ### Snapshot builder (`loops/snapshots.py`)
 - **Cadence:** emits on the `SNAPSHOT_INTERVAL_SECONDS` (10 s) grid boundary.
-- Replays `raw_events` in ingest order with **strict per-market sequence
-  checking**; maintains an in-memory `OrderBook` per active market. Every tick
-  emits one row per active market to `snapshots` (top-of-book, within-band
-  depth, window trade volume, last trade, status), carrying the book forward
-  (LOCF) for quiet markets. Idempotent on `(ts, platform, market_id)`.
+- Replays `raw_events` in ingest order, forwarding each to that market's
+  **`BookReconstructor`** (`reconstruct.py`) — a deep per-market state machine
+  that owns the sequence discipline (§6). Every tick emits one row per active
+  market to `snapshots` (top-of-book, within-band depth, window trade volume,
+  last trade, status), carrying the book forward (LOCF) for quiet markets.
+  Idempotent on `(ts, platform, market_id)`.
 - **Anchoring & gaps:** deltas apply only after a snapshot anchors the book; a
   `seq` gap discards that market's book and requests a fresh snapshot.
 - **Checkpoints** every `CHECKPOINT_INTERVAL_SECONDS` (60 s) to `book_state`
   (and on clean shutdown) so a restart resumes from the checkpoint + replay
   forward instead of from scratch. `replay_floor_ts` skips events already folded
-  into a checkpoint.
+  into a checkpoint. The replay cursor starts at the **earliest checkpoint
+  floor**; with no checkpoints (first boot, or only freshly-discovered markets)
+  it starts at the **current tail** and books anchor from the next live WS
+  snapshot — it never rewinds to the start of the append-only `raw_events` log
+  (which would rescan unbounded history and stall the loop as the DB grows).
+- **Grid is forward-only.** The builder emits the current boundary each tick; it
+  does **not** backfill boundaries missed during a restart/downtime, even where
+  the underlying events survive in `raw_events`. So the `snapshots` grid can have
+  gaps across restarts, and the solver must tolerate missing `ts` rows. This is a
+  deliberate Stage-1 simplification — the grid is fully regenerable from
+  `raw_events`, so dense re-materialization can be added later (alongside the
+  planned R2/Parquet export, §11) without changing the ingest.
 - **Canaries** (per market, per tick): `crossed_book`, `negative_size`,
   `out_of_range_price` force a book reset; a stale-market check is informational.
 
@@ -143,6 +160,17 @@ shutdown) / `__main__.py`. Shared state in `runtime.py` (`BookStore`,
   catalog/discovery), diffs them, classifies `no_diff` / `small_diff` /
   `large_diff`, writes a row to `audit_results`, and forces a **book reset** on a
   large diff. One market's error never aborts the pass.
+- **Classification is primarily structural, with a size backstop.** The freeze
+  happens ~100 ms before the REST fetch, so *small* per-level size drift on
+  levels present in both books is expected market movement, not desync. The main
+  signal is **structural** divergence — a price level present in one book but
+  absent in the other. `large_diff` (→ reset) fires when structural mismatches
+  across both sides exceed `AUDIT_STRUCTURAL_DIFF_MAX_LEVELS` (4) **or** when a
+  shared level's size differs by more than `AUDIT_SMALL_DIFF_MAX_SIZE_PCT` (50 %);
+  otherwise `small_diff` (near-touch churn, no action). The size ceiling is a
+  deliberately-high backstop: it stays quiet through ordinary liquid-market churn
+  but catches a *magnitude* bug (e.g. a fixed-point/decode error that yields the
+  right levels at wrong sizes) that the structural test alone cannot see.
 
 ---
 
@@ -214,10 +242,14 @@ of the touch on each side — this is the headline anti-stale-quote signal. The
 snapshot columns hard-code **`3c`** (`DEPTH_BAND_PRICE_UNITS = 0.03`); changing
 the constant shifts the meaning but not the names.
 
-Reconstruction discipline in the snapshot builder: a **snapshot anchors** the
-book; **deltas** apply only while anchored and only for the next contiguous
-`seq`; a duplicate/old `seq` is dropped; a forward gap triggers reset + fresh
-snapshot. Reset paths: sequence gap, structural canary, or audit large-diff.
+Reconstruction discipline lives in **`reconstruct.py`** (`BookReconstructor.apply`),
+not scattered across the snapshot loop: a **snapshot anchors** the book;
+**deltas** apply only while anchored and only for the next contiguous `seq`; a
+duplicate/old `seq` is dropped; a forward gap returns `RESET`. The snapshot
+builder just forwards drained events and, on `RESET`, calls the reset seam
+(`runtime.request_reset` — the one place that resets the in-memory book *and*
+enqueues the WS re-subscribe). Reset paths: sequence gap, structural canary, or
+audit large-diff.
 
 ---
 
@@ -235,6 +267,10 @@ snapshot. Reset paths: sequence gap, structural canary, or audit large-diff.
   monotonic per subscription. Parses `orderbook_snapshot` / `orderbook_delta` /
   `trade` / `market_lifecycle_v2` into `NormalizedEvent`s; never raises on a bad
   message (logs and drops). Hosts/paths per `KALSHI_ENV` live in `config.py`.
+- **Fixed-point (`kalshi/fixedpoint.py`):** the one module that decodes Kalshi's
+  `*_fp` / `*_dollars` numeric surface (price/size levels, contract volume).
+  Shared by the WS parser, the REST audit, the catalog poller, and the discovery
+  predicates — so a units question is verified and fixed in one place.
 
 The exchange-agnostic seam is `subscriber.py::BaseSubscriber`: a new venue is one
 new file implementing `ws_url` / `connect_headers` / `subscribe_message` /
@@ -247,7 +283,7 @@ venue-neutral (`platform` tag on every row).
 
 - **Configuration split.** Only **four** values come from the environment/`.env`
   (`KALSHI_API_KEY_ID`, `KALSHI_API_SECRET`, `KALSHI_ENV`, `SIMPLEX_DATA_DIR`;
-  see `config.py`, `.env.example`). **Everything tunable** (intervals, depth
+  see `config.py`, `ingest/.env.example`). **Everything tunable** (intervals, depth
   band, audit thresholds, rate limits, ports, reconnect bounds, predicate
   thresholds, log level) is a documented constant in `constants.py`. No env
   lookups for behavior — edit a constant and redeploy.
@@ -256,8 +292,9 @@ venue-neutral (`platform` tag on every row).
   (`AUDIT_REST_*`, 4/4) so an audit pass can't starve the pollers.
 - **Supervision & restart (`supervisor.py`).** Per-loop jittered backoff bounded
   by `SUPERVISOR_RESTART_*`; backoff resets after a 60 s healthy run.
-- **Liveness (`runtime.Heartbeats`, `health.py`).** Each loop beats around its
-  idle sleeps; `/health` reports per-loop liveness and 200/503.
+- **Liveness (`runtime.Heartbeats`, `health.py`).** Loops idle through the shared
+  `util.idle_sleep` (wake-on-shutdown + periodic heartbeat in one place, so a loop
+  can't silently stop beating); `/health` reports per-loop liveness and 200/503.
 - **Logging (`log.py`).** Structured JSON to stdout, one object per line, tagged
   with `loop` and contextual `extra` fields. Level via `LOG_LEVEL`.
 - **Shutdown.** SIGTERM/SIGINT → cancel supervisor + the discovery-grace task →
@@ -286,21 +323,33 @@ venue-neutral (`platform` tag on every row).
 
 ## 10. Repository layout
 
+The repo is a **monorepo**: each deployable service is a self-contained
+subdirectory (Railway Root Directory + Watch Paths, §11). Today there is one
+service, `ingest/`; future services are siblings.
+
 ```
-src/simplex_ingest/
-  app.py  __main__.py        # entry: wire loops, signals, health, shutdown
-  config.py  constants.py    # 4-value env surface  /  all tuning knobs
-  schema.sql  db.py          # DuckDB: shared conn, write lock, batched writes
-  events.py  orderbook.py    # NormalizedEvent  /  in-memory book + depth + canaries
-  discovery_predicates.py    # pure admit/rank predicates (no I/O)
-  subscriber.py              # BaseSubscriber (one new file per future venue)
-  runtime.py supervisor.py health.py util.py log.py
-  kalshi/    auth.py rest.py subscriber.py
-  loops/     discovery.py catalog.py websocket.py snapshots.py audit.py
-tests/                       # pytest+hypothesis: predicates, DB atomicity, loops
-docs/      ARCHITECTURE.md DEPLOY.md
-Dockerfile entrypoint.sh railway.json   # deploy layer (see DEPLOY.md)
+ingest/                      # the ingest service — self-contained, deployable
+  Dockerfile entrypoint.sh railway.json   # deploy layer (see DEPLOY.md)
+  .dockerignore .env.example pyproject.toml
+  src/simplex_ingest/
+    app.py  __main__.py      # entry: wire loops, signals, health, shutdown
+    config.py  constants.py  # 4-value env surface  /  all tuning knobs
+    schema.sql  db.py        # DuckDB: shared conn, write lock, batched writes
+    events.py  orderbook.py  # NormalizedEvent  /  in-memory book + depth + canaries
+    reconstruct.py           # BookReconstructor: per-market replay state machine
+    discovery_predicates.py  # pure admit/rank predicates (no I/O)
+    subscriber.py            # BaseSubscriber (one new file per future venue)
+    runtime.py supervisor.py health.py util.py log.py
+    kalshi/  auth.py rest.py subscriber.py fixedpoint.py   # fixedpoint: fp/dollars decoding
+    loops/   discovery.py catalog.py websocket.py snapshots.py audit.py
+  tests/                     # pytest+hypothesis: predicates, DB atomicity, loops
+docs/      ARCHITECTURE.md DEPLOY.md   # repo-level (shared across services)
+CLAUDE.md  README.md
+# future siblings (not yet created): trader/  viz/  libs/simplex_core/
 ```
+
+`pip install -e ".[test]"`, `pytest`, and `python -m simplex_ingest…` all run
+from inside `ingest/`. Package name and imports are unchanged by the move.
 
 ---
 
@@ -312,10 +361,15 @@ deliberately.
 
 ### Stage 3 — the solver
 Reads the `snapshots` marginal grid and structural relationships, computes the
-max-entropy joint and coherence/deviation scores. It can begin as a **6th loop
-in-process** (no DB-sharing problem — it only reads what this process writes) or
-split into its own service later. Splitting early forces the storage decision
-below sooner; in-process keeps it simple but couples deploy/restart.
+max-entropy joint and coherence/deviation scores. It **must begin as a 6th loop
+in-process** — not because in-process is merely simpler, but because the
+single-writer DuckDB lock (§9.2) means a *separate* solver process **cannot open
+`simplex.duckdb` at all** while ingest holds it (read-only opens fail too). So a
+standalone solver service is not an option until the storage inflection below
+gives it an independent place to read from. In-process the solver only reads what
+this process already writes, with no DB-sharing problem; it splits out **after**
+the OLTP/OLAP split (e.g. reading snapshots from R2/Parquet or a replica), not
+before.
 
 ### LLM-in-the-loop autonomous trading
 This is the highest-risk addition and should be a **separate process/service**
@@ -346,9 +400,52 @@ DuckDB while ingest is writing. When a second writer appears:
   corpus once the volume's size cap bites.
 
 ### Deployment shape as it grows
-A small fleet of single-instance services — `ingest` (autodeploy-on-push is fine,
-low blast radius), `solver`, `trader` (deliberate deploys, **not** autodeploy:
-never redeploy a process holding open orders) — plus managed Postgres and object
-storage. Trading timescale is seconds-to-minutes (the 10 s grid), so co-location
-/ ultra-low latency is **not** a requirement; Railway remains a fit. The
-deploy-side consequences are detailed in [`DEPLOY.md`](./DEPLOY.md).
+The monorepo (above) already encodes the pattern: **one repo, per-service Root
+Directory + Watch Paths**, each service building from its own sibling folder. The
+fleet grows additively into a set of single-instance services — `ingest`
+(autodeploy-on-push is fine, low blast radius; Watch Paths keep unrelated pushes
+from rebuilding it), the in-process `solver` (ships inside `ingest/` until the
+storage split), and `trader` (deliberate deploys, **not** autodeploy: never
+redeploy a process holding open orders) — plus managed Postgres and object
+storage attached per-service. Trading timescale is seconds-to-minutes (the 10 s
+grid), so co-location / ultra-low latency is **not** a requirement; Railway
+remains a fit. The deploy-side consequences are detailed in
+[`DEPLOY.md`](./DEPLOY.md) §13.
+
+**The deferred `libs/simplex_core` split.** Extracting shared code into a
+`libs/simplex_core` package is deliberately deferred to **trader-time** (the
+first second consumer), because the core/ingest boundary is partly a guess until
+the trader's needs are concrete. The recent deepening cut most of the seams
+(`BaseSubscriber`, `kalshi/`, `fixedpoint`, `config`), but the split is **not yet
+a clean `git mv`** — a few first-party imports still cross the intended boundary
+and must be cut first (see "pre-extraction cleanup" below). The intended target
+boundary:
+
+- **core (→ `libs/simplex_core`)** — venue-agnostic plumbing reused by any
+  consumer: `kalshi/{auth,rest,fixedpoint}`, `subscriber.py` (`BaseSubscriber`),
+  `config.py`, `log.py`, `util.py`, the `Loop`/`Heartbeats` half of `runtime.py`,
+  `supervisor.py`, `health.py`, `events.py`.
+- **ingest-specific (stays in `ingest/`)** — `loops/`, `discovery_predicates.py`,
+  `db.py` + `schema.sql`, `constants.py`, `orderbook.py`, `reconstruct.py`,
+  `app.py`, and the `BookStore`/`request_reset` half of `runtime.py`.
+
+**Pre-extraction cleanup (known boundary leaks, do these when the split lands).**
+A core module must not import ingest-specific code; today three kinds of leak do:
+
+1. **`constants` imported by core** — `supervisor.py`, `health.py`, and
+   `kalshi/rest.py` read tuning (restart bounds, heartbeat timeout, REST rate
+   limits) directly from `constants.py` (ingest-specific). Cut by **injecting**
+   those values (constructor args / a small config object) so the core modules
+   take parameters and `ingest/` supplies them from `constants.py`.
+2. **`runtime.py` mixes core and ingest** — it holds the generic `Loop`/
+   `Heartbeats` (core) *and* `BookStore` + `request_reset`, which depend on
+   `orderbook` and `reconstruct` (ingest-specific). Split the file: `Loop`/
+   `Heartbeats` go to core, `BookStore`/`request_reset` stay ingest-side.
+3. **`kalshi/fixedpoint.py` imports `orderbook._q`** — the price-key quantizer.
+   `_q` is a fixed-point concern; relocate it into `fixedpoint` and have
+   `orderbook` import it from there (reverse the dependency).
+
+When that split lands, services depending on `libs/simplex_core` switch to a
+repo-root build context (a Dockerfile only `COPY`s from inside its context) with
+Watch Paths scoped to their folder + `libs/**` — see [`DEPLOY.md`](./DEPLOY.md)
+§13.

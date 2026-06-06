@@ -1,4 +1,4 @@
-"""Process entry point: wire the four loops under one supervisor.
+"""Process entry point: wire the five loops under one supervisor.
 
 Owns the shared DuckDB connection, the Kalshi clients, the shared runtime state,
 the /health server, and clean SIGTERM shutdown (cancel loops -> flush DB ->
@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import signal
 from dataclasses import dataclass
-from typing import Any
 
 from . import constants as C
 from .config import Settings, get_settings
@@ -25,7 +24,7 @@ from .loops.catalog import CatalogPoller
 from .loops.discovery import DiscoveryLoop
 from .loops.snapshots import SnapshotBuilder
 from .loops.websocket import WebSocketLoop
-from .runtime import BookStore, Heartbeats
+from .runtime import BookStore, Heartbeats, Loop
 from .supervisor import run_supervised
 from .util import TokenBucket
 
@@ -64,7 +63,7 @@ def build_runtime(settings: Settings) -> Runtime:
         audit_rest=audit_rest,
         subscriber=subscriber,
         book_store=BookStore(),
-        reset_requests=asyncio.Queue(),
+        reset_requests=asyncio.Queue(maxsize=C.RESET_REQUEST_QUEUE_MAXSIZE),
         resubscribe_event=asyncio.Event(),
         heartbeats=Heartbeats(),
         shutdown=asyncio.Event(),
@@ -80,7 +79,9 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.
         try:
             loop.add_signal_handler(sig, _request_shutdown, sig)
         except NotImplementedError:  # e.g. non-main thread / unsupported platform
-            signal.signal(sig, lambda *_: shutdown.set())
+            # A raw C-level signal handler must not touch the loop directly;
+            # hop onto the loop thread to set the Event safely.
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(shutdown.set))
 
 
 async def _warn_if_discovery_stalled(rt: Runtime) -> None:
@@ -109,7 +110,7 @@ async def run() -> int:
 
     rt = build_runtime(settings)
     builder = SnapshotBuilder(rt)
-    loops: list[Any] = [
+    loops: list[Loop] = [
         CatalogPoller(rt),
         WebSocketLoop(rt),
         builder,

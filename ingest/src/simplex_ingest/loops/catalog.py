@@ -14,8 +14,9 @@ import asyncio
 import json
 
 from .. import constants as C
+from ..kalshi.fixedpoint import volume
 from ..log import get_logger
-from ..util import market_volume, now_utc, parse_dt, naive_utc
+from ..util import idle_sleep, naive_utc, now_utc, parse_dt
 
 log = get_logger("catalog")
 
@@ -63,18 +64,7 @@ class CatalogPoller:
             except Exception:
                 log.exception("catalog refresh failed")
             self.rt.heartbeats.beat(self.name)
-            await self._sleep(C.CATALOG_REFRESH_SECONDS)
-
-    async def _sleep(self, seconds: float) -> None:
-        # Wake early on shutdown; heartbeat periodically while idle.
-        remaining = seconds
-        while remaining > 0 and not self.rt.shutdown.is_set():
-            step = min(15.0, remaining)
-            try:
-                await asyncio.wait_for(self.rt.shutdown.wait(), timeout=step)
-            except asyncio.TimeoutError:
-                self.rt.heartbeats.beat(self.name)
-            remaining -= step
+            await idle_sleep(self.rt.shutdown, self.rt.heartbeats, self.name, C.CATALOG_REFRESH_SECONDS)
 
     async def refresh(self) -> None:
         series_list = await asyncio.to_thread(self.rt.db.get_tracked_series)
@@ -103,7 +93,7 @@ class CatalogPoller:
                 for market in event.get("markets") or []:
                     if market.get("status") not in _TRADEABLE:
                         continue
-                    if market_volume(market) < C.CATALOG_MIN_MARKET_VOLUME:
+                    if volume(market) < C.CATALOG_MIN_MARKET_VOLUME:
                         continue
                     ticker = market.get("ticker")
                     if not ticker:

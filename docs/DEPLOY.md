@@ -5,8 +5,9 @@
 > `entrypoint.sh`, env surface, volume/storage, health/ports, deploy procedure,
 > or scaling constraints **must** update this file in the same change. System
 > *design* lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md); the rule is restated
-> in the repo-root [`CLAUDE.md`](../CLAUDE.md). This file is the canonical,
-> expanded successor to the older `README-DEPLOY.md` quickstart at the repo root.
+> in the repo-root [`CLAUDE.md`](../CLAUDE.md). This file is the canonical
+> deployment reference (it superseded and replaced an older `README-DEPLOY.md`
+> root quickstart).
 
 ---
 
@@ -26,9 +27,13 @@ never **out**. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.2.
 
 ---
 
-## 2. The image (`Dockerfile`)
+## 2. The image (`ingest/Dockerfile`)
 
-Multi-stage, Python **3.13-slim** (matches the dev/tested runtime):
+Multi-stage, Python **3.13-slim** (matches the dev/tested runtime). The build
+context is the **`ingest/` service folder** (Railway **Root Directory = `ingest`**,
+§7), so the Dockerfile's `COPY pyproject.toml ./` / `COPY src ./src` resolve
+against `ingest/` — no content edits were needed when the service moved into
+`ingest/`.
 
 - **builder:** creates `/opt/venv`, `pip install .` from `pyproject.toml` + `src`.
   Asserts `schema.sql` got packaged (`db.py` reads it at runtime) — the build
@@ -53,7 +58,7 @@ shell and receives SIGTERM directly for a clean shutdown.
 
 ---
 
-## 3. `railway.json`
+## 3. `ingest/railway.json`
 
 ```json
 {
@@ -68,7 +73,9 @@ shell and receives SIGTERM directly for a clean shutdown.
 ```
 
 Build from the Dockerfile; healthcheck `/health` with a 300 s window; restart
-`ON_FAILURE` effectively unbounded. (Switch to `"ALWAYS"` if you want restarts on
+`ON_FAILURE` effectively unbounded. With **Root Directory = `ingest`** (§7),
+`dockerfilePath: "Dockerfile"` resolves to `ingest/Dockerfile` — the path is
+relative to the service root, so it needs no change. (Switch to `"ALWAYS"` if you want restarts on
 clean exits too — not wanted today, since a clean exit is an intentional SIGTERM.)
 
 ---
@@ -95,8 +102,8 @@ injects `$PORT`; set it explicitly only if the healthcheck can't reach the app.
 be perfect: `config.py::normalize_pem()` recovers the key whether newlines arrive
 intact, `\n`-escaped, glued onto one line, or given as a path to a `.pem` file.
 
-Secrets never go in the image — `.dockerignore` excludes `.env`, `.env.*`,
-`*.pem`. Locally, copy `.env.example` → `.env`.
+Secrets never go in the image — `ingest/.dockerignore` excludes `.env`, `.env.*`,
+`*.pem`. Locally, copy `ingest/.env.example` → `ingest/.env` (§12).
 
 ---
 
@@ -132,8 +139,18 @@ If it won't stick, toggle **on → off → redeploy** to push the real `false`.
 
 ## 7. Deploying
 
-Two ways. The repo root is the build context; **Root Directory = `/`** (the
-Dockerfile and `railway.json` are at the root).
+**Service source settings (set once).** The ingest service builds from its own
+subdirectory, so in Service → **Settings → Source**:
+
+- **Root Directory = `ingest`** — the build context is the `ingest/` folder, so
+  `Dockerfile`, `railway.json`, and `.dockerignore` resolve inside it. (This was
+  `/` before the service was relocated into `ingest/`.)
+- **Watch Paths = `ingest/**`** — only redeploy when ingest's own files change.
+  Docs-only or future `trader/`/`viz/` pushes then don't rebuild ingest. This is
+  the per-service monorepo mechanism (each service = Root Directory + Watch
+  Paths); see §13.
+
+Two ways to deploy:
 
 ### Option A — GitHub autodeploy on push (current setup)
 Service → **Settings → Source → Connect Repo** → `routsiddharth/simplex`, branch
@@ -249,15 +266,16 @@ Proper off-site backup is the planned **R2 export** (Stage 5), shipping
 ## 12. Local run (parity with prod)
 
 ```bash
+cd ingest                   # the service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env        # fill the four values (KALSHI_ENV=demo to start)
 python -m simplex_ingest    # five loops; GET :8080/health
-pytest                      # 48 tests
+pytest                      # 116 tests
 python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
 ```
 
-Local uses `SIMPLEX_DATA_DIR=./data` by default. The one-shot discovery and a
+Local uses `SIMPLEX_DATA_DIR=./data` by default (relative to `ingest/`). The one-shot discovery and a
 brief full run against `demo` (or `prod` with a low rate budget) are the
 pre-deploy smoke checks.
 
@@ -265,13 +283,38 @@ pre-deploy smoke checks.
 
 ## 13. Future deployment topology (as the system grows)
 
-When the solver and the LLM-trading layer land, this single service becomes a
-small **fleet of single-instance services** — `ingest` (autodeploy OK), `solver`,
-`trader` (deliberate deploys only) — plus **managed Postgres** for transactional
-trade/position state and **object storage** for the historical corpus. The
-driver is the single-writer DuckDB constraint plus the very different risk profile
-of a money-moving process. Trading timescale (seconds-to-minutes, per the 10 s
-grid) means low-latency co-location is **not** required; Railway stays a fit. Full
-rationale and the OLTP/OLAP split are in
+The `ingest/` relocation (this doc's current state) establishes the monorepo
+pattern: **one repo, per-service Root Directory + Watch Paths**, each service a
+sibling folder building from its own subdirectory. Today there is exactly **one**
+service (`ingest`); the layout makes the rest additive.
+
+When the solver and the LLM-trading layer land, this becomes a small **fleet of
+single-instance services**, each its own Railway service pointed at a sibling
+folder:
+
+| Service | Root Directory | Autodeploy | Storage | Notes |
+|---|---|---|---|---|
+| `ingest` | `ingest` | **ON** | `/data` volume (DuckDB) | read-only, low blast radius; Watch Paths `ingest/**` keep docs/trader pushes from rebuilding it |
+| `trader` | `trader` | **OFF** | own **Postgres** | money-moving; never redeploy a process holding open orders — deliberate deploys only |
+| `viz` | `viz` | ON | — / R2 | presentation only |
+
+Plus **managed Postgres** for transactional trade/position state and **object
+storage (R2)** for the historical corpus, **attached per-service** (each service
+mounts only what it needs). The driver for splitting at all is the single-writer
+DuckDB constraint plus the very different risk profile of a money-moving process;
+the **solver starts as a 6th in-process loop inside `ingest/`** (it cannot open
+the live DuckDB from a separate process) and only splits out after the OLTP/OLAP
+storage inflection. Trading timescale (seconds-to-minutes, per the 10 s grid)
+means low-latency co-location is **not** required; Railway stays a fit.
+
+**Build-context wrinkle (future).** Once a shared `libs/simplex_core` is
+extracted (deferred to trader-time), any service that depends on it can no longer
+build from its own subdirectory — a Dockerfile only `COPY`s from inside its build
+context. Those services switch to a **repo-root build context** (Root Directory
+`/`) with **Watch Paths scoped** to their folder + `libs/**`, while
+`ingest`-without-the-split can stay rooted at `ingest/`. Plan this when the split
+happens.
+
+Full rationale and the OLTP/OLAP split are in
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) §11 — update both files together when that
 work begins.

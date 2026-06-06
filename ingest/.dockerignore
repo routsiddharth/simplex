@@ -18,8 +18,7 @@ venv/
 build/
 dist/
 
-# VCS / docs / OS cruft not needed in the image
+# VCS / OS cruft not needed in the image
 .git/
 .gitignore
-README-DEPLOY.md
 .DS_Store

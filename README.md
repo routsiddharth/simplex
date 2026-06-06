@@ -24,7 +24,7 @@ the coherence engine itself is the next stage.
 | Stage | Scope | State |
 |------|-------|-------|
 | **1. Ingest** | Live Kalshi order books → normalized event log → 10s snapshot grid, with catalog discovery, book reconstruction, checkpointing, and a hourly REST reconciliation audit. | **Built** |
-| 2. Deploy | Containerized, runs 24/7 on a mounted volume (Railway / Fly.io). | **Built** (`Dockerfile`, `railway.json`, `README-DEPLOY.md`) |
+| 2. Deploy | Containerized, runs 24/7 on a mounted volume (Railway / Fly.io). | **Built** (`ingest/Dockerfile`, `ingest/railway.json`, [`docs/DEPLOY.md`](./docs/DEPLOY.md)) |
 | 3. Solver | Max-entropy joint distribution over related markets given snapshot marginals + structural constraints (partitions, hierarchy, mutual exclusivity); coherence/deviation scoring. | Planned |
 | 4. Graph + viz | Relationship graph across markets; surface the largest incoherences over time. | Planned |
 | 5. Export | Continuous R2 export of `snapshots` / `raw_events` for offline analysis & backup. | Planned |
@@ -87,7 +87,7 @@ A crash in any one loop is restarted by a supervisor without taking the others
 down. SIGTERM flushes, checkpoints, closes the DB, and exits 0. `/health`
 (port 8080) returns 200 only when all five loops are alive.
 
-### Data model (DuckDB — `src/simplex_ingest/schema.sql`)
+### Data model (DuckDB — `ingest/src/simplex_ingest/schema.sql`)
 
 | Table | Role |
 |-------|------|
@@ -105,6 +105,7 @@ down. SIGTERM flushes, checkpoints, closes the DB, and exits 0. `/health`
 Requires Python 3.13 and Kalshi API credentials (an API key ID + RSA private key).
 
 ```bash
+cd ingest                   # the ingest service is self-contained under ingest/
 python3 -m venv venv && source venv/bin/activate
 pip install -e .
 
@@ -143,7 +144,7 @@ Two homes, deliberately separated:
 | `KALSHI_ENV` | `prod` or `demo` |
 | `SIMPLEX_DATA_DIR` | where the DuckDB file lives (`./data` local, `/data` in prod) |
 
-**`src/simplex_ingest/constants.py` — every tuning knob** (intervals, depth band,
+**`ingest/src/simplex_ingest/constants.py` — every tuning knob** (intervals, depth band,
 audit window/thresholds, rate limits, reconnect bounds, health port, log level),
 each documented inline. No environment lookups; edit and redeploy to tune.
 
@@ -152,28 +153,37 @@ each documented inline. No environment lookups; edit and redeploy to tune.
 ## Deployment
 
 Containerized and built to run 24/7 (the persistent WebSocket means it must not
-scale to zero). See **[`README-DEPLOY.md`](./README-DEPLOY.md)** for Railway
-setup — secrets, the 10 GB volume at `/data`, disabling serverless, and the one
-gotcha (`PORT=8080`). The image runs as a non-root user; SIGTERM is handled
+scale to zero). See **[`docs/DEPLOY.md`](./docs/DEPLOY.md)** for Railway setup —
+the service builds from `ingest/` (**Root Directory = `ingest`**, Watch Paths
+`ingest/**`), secrets, the 10 GB volume at `/data`, disabling serverless, and the
+one gotcha (`PORT=8080`). The image runs as a non-root user; SIGTERM is handled
 cleanly. The same image suits any single-machine + mounted-volume host (Fly.io).
 
 ---
 
 ## Repository layout
 
+The repo is a **monorepo**; the ingest service is self-contained under `ingest/`,
+with `docs/`, `README.md`, and `CLAUDE.md` at the repo root. Future services
+(`trader`, `viz`) land as siblings.
+
 ```
-src/simplex_ingest/
-  app.py  __main__.py        # entry point: wire loops, signals, shutdown
-  config.py  constants.py    # 4-value env surface  /  tuning knobs
-  schema.sql  db.py          # DuckDB: shared conn, write lock, batched writes
-  events.py  orderbook.py    # normalized events  /  in-memory book + depth + canaries
-  subscriber.py              # BaseSubscriber (one new file per future exchange)
-  runtime.py supervisor.py health.py util.py log.py
-  discovery_predicates.py    # pure admit/rank predicates (no I/O)
-  kalshi/    auth.py rest.py subscriber.py
-  loops/     catalog.py websocket.py snapshots.py audit.py discovery.py
-tests/                       # pytest suite: predicates, DB atomicity, loop
-Dockerfile  entrypoint.sh  railway.json  README-DEPLOY.md
+ingest/                      # the ingest service — self-contained, deployable
+  Dockerfile  entrypoint.sh  railway.json  .dockerignore  .env.example  pyproject.toml
+  src/simplex_ingest/
+    app.py  __main__.py      # entry point: wire loops, signals, shutdown
+    config.py  constants.py  # 4-value env surface  /  tuning knobs
+    schema.sql  db.py        # DuckDB: shared conn, write lock, batched writes
+    events.py  orderbook.py  # normalized events  /  in-memory book + depth + canaries
+    reconstruct.py           # per-market order-book replay state machine
+    subscriber.py            # BaseSubscriber (one new file per future exchange)
+    runtime.py supervisor.py health.py util.py log.py
+    discovery_predicates.py  # pure admit/rank predicates (no I/O)
+    kalshi/    auth.py rest.py subscriber.py fixedpoint.py
+    loops/     catalog.py websocket.py snapshots.py audit.py discovery.py
+  tests/                     # pytest suite: predicates, DB atomicity, loop
+docs/      ARCHITECTURE.md DEPLOY.md   # repo-level
+README.md  CLAUDE.md
 ```
 
 Adding another exchange later is a new `subscriber.py` implementing

@@ -19,6 +19,7 @@ from ..events import EventType, NormalizedEvent
 from ..log import get_logger
 from ..subscriber import BaseSubscriber
 from .auth import KalshiSigner
+from .fixedpoint import levels, to_float
 
 log = get_logger("ws")
 
@@ -26,34 +27,13 @@ _CONTROL_TYPES = {"subscribed", "unsubscribed", "ok", "error", "subscriptions"}
 _WS_SIGNING_PATH = "/trade-api/ws/v2"
 
 
-def _f(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _levels(raw: Any) -> list[tuple[float, float]]:
-    """Parse [[price_str, size_str], ...] -> [(price, size), ...]."""
-    out: list[tuple[float, float]] = []
-    for pair in raw or []:
-        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-            continue
-        p, s = _f(pair[0]), _f(pair[1])
-        if p is not None and s is not None:
-            out.append((p, s))
-    return out
-
-
 def _ts_from_ms(ms: Any) -> datetime | None:
-    v = _f(ms)
+    v = to_float(ms)
     return datetime.fromtimestamp(v / 1000.0, timezone.utc) if v else None
 
 
 def _ts_from_s(s: Any) -> datetime | None:
-    v = _f(s)
+    v = to_float(s)
     return datetime.fromtimestamp(v, timezone.utc) if v else None
 
 
@@ -119,8 +99,8 @@ class KalshiSubscriber(BaseSubscriber):
 
             if mtype == "orderbook_snapshot":
                 payload = {
-                    "yes": _levels(msg.get("yes_dollars_fp") or msg.get("yes")),
-                    "no": _levels(msg.get("no_dollars_fp") or msg.get("no")),
+                    "yes": levels(msg.get("yes_dollars_fp") or msg.get("yes")),
+                    "no": levels(msg.get("no_dollars_fp") or msg.get("no")),
                 }
                 return [NormalizedEvent(received_ts, self.platform, market_id,
                                         EventType.ORDERBOOK_SNAPSHOT, payload,
@@ -129,9 +109,9 @@ class KalshiSubscriber(BaseSubscriber):
             if mtype == "orderbook_delta":
                 payload = {
                     "side": msg.get("side"),
-                    "price": _f(msg.get("price_dollars") or msg.get("price")),
-                    "delta": _f(msg.get("delta_fp") if msg.get("delta_fp") is not None
-                                else msg.get("delta")),
+                    "price": to_float(msg.get("price_dollars") or msg.get("price")),
+                    "delta": to_float(msg.get("delta_fp") if msg.get("delta_fp") is not None
+                                      else msg.get("delta")),
                 }
                 return [NormalizedEvent(received_ts, self.platform, market_id,
                                         EventType.ORDERBOOK_DELTA, payload,
@@ -139,9 +119,9 @@ class KalshiSubscriber(BaseSubscriber):
 
             if mtype == "trade":
                 payload = {
-                    "price": _f(msg.get("yes_price_dollars")),
-                    "no_price": _f(msg.get("no_price_dollars")),
-                    "count": _f(msg.get("count_fp")),
+                    "price": to_float(msg.get("yes_price_dollars")),
+                    "no_price": to_float(msg.get("no_price_dollars")),
+                    "count": to_float(msg.get("count_fp")),
                     "taker_side": msg.get("taker_side"),
                     "trade_id": msg.get("trade_id"),
                 }

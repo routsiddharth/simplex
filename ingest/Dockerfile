@@ -17,8 +17,10 @@ COPY pyproject.toml ./
 COPY src ./src
 
 RUN pip install --no-cache-dir . \
-    # Fail the build now if schema.sql didn't get packaged (db.py reads it at runtime).
-    && test -f /opt/venv/lib/python3.13/site-packages/simplex_ingest/schema.sql
+    # Fail the build now if schema.sql didn't get packaged (db.py reads it at
+    # runtime). Ask Python where the package landed so this survives an
+    # interpreter-version bump rather than hard-coding a python3.13 path.
+    && python -c "import pathlib, simplex_ingest; p = pathlib.Path(simplex_ingest.__file__).with_name('schema.sql'); assert p.is_file(), f'schema.sql not packaged at {p}'"
 
 # ---- runtime: slim image, non-root app process -----------------------------
 FROM python:3.13-slim AS runtime
@@ -46,7 +48,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Health server port (constants.HEALTH_PORT). Railway must be told to target this
-# via a PORT=8080 service variable (see README-DEPLOY.md).
+# via a PORT=8080 service variable (see docs/DEPLOY.md §4).
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

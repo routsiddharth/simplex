@@ -12,6 +12,7 @@ import time
 
 from . import constants as C
 from .log import get_logger
+from .runtime import Loop
 from .util import Backoff
 
 log = get_logger("supervisor")
@@ -19,7 +20,7 @@ log = get_logger("supervisor")
 _HEALTHY_RUN_SECONDS = 60.0  # a run lasting this long resets the backoff
 
 
-async def _supervise(loop_obj, shutdown: asyncio.Event) -> None:
+async def _supervise(loop_obj: Loop, shutdown: asyncio.Event) -> None:
     name = loop_obj.name
     backoff = Backoff(
         C.SUPERVISOR_RESTART_MIN_SECONDS,
@@ -45,6 +46,6 @@ async def _supervise(loop_obj, shutdown: asyncio.Event) -> None:
         log.info("loop restart scheduled", extra={"loop": name, "delay_s": round(delay, 2)})
 
 
-async def run_supervised(loops: list, shutdown: asyncio.Event) -> None:
+async def run_supervised(loops: list[Loop], shutdown: asyncio.Event) -> None:
     """Run every loop under its own supervisor until shutdown/cancellation."""
     await asyncio.gather(*(_supervise(lp, shutdown) for lp in loops))

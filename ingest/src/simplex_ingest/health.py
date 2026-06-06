@@ -40,7 +40,9 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, he
         )
         await writer.drain()
     except Exception:
-        pass
+        # A dropped/half-open client connection is routine; keep it off the
+        # normal path but leave a breadcrumb for a persistent write/format fault.
+        log.debug("health request handling failed", exc_info=True)
     finally:
         writer.close()
 
