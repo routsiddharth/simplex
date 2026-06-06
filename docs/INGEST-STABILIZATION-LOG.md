@@ -48,12 +48,31 @@ still decoded them from REST (`level_map`) → permanent structural diff →
 predicate into the decode home (`kalshi/fixedpoint.in_tradeable_band`), applied to
 **both** the WS apply path and the REST audit decode.
 
-### Uncommitted (prepared, not pushed) — liquidity floor + bulk upsert
+### `64ea5f2` — liquidity floor + bulk upsert
 - `CATALOG_MIN_MARKET_VOLUME` **0 → 100** (set from the live distribution below).
 - `db.upsert_snapshots`: multi-row `INSERT … ON CONFLICT` instead of row-by-row
   `executemany` (~2.4× faster, dependency-free).
 - Tests: liquidity-floor exclusion; existing catalog tests given above-floor
   volume. Docs updated.
+
+### Cheapest-model cost measure (2026-06-07)
+Temporary, to hold LLM spend near zero during stabilization (the Anthropic batch
+discount is unavailable — no account credits — so everything degrades to
+full-price sync OpenRouter). The three **OpenRouter sync** model ids in
+`constants.py`:
+- `EXTRACTION_MODEL` / `PAIR_MODEL` → `deepseek/deepseek-v4-flash-20260423`
+  (~$0.10/M in, structured-output ✓ — near-cheapest reliable on OpenRouter).
+- `PAIR_VERIFY_MODEL` → `google/gemini-3.1-flash-lite-20260507` — a *different
+  family* (kept distinct so the trust gate stays an independent cross-check, not
+  same-model self-agreement, which would flood the `trusted` tier).
+- `BATCH_*` (Anthropic-direct) ids **unchanged** (different provider/host; failing
+  on credits regardless of model).
+
+**Restore** `anthropic/claude-sonnet-4.6` (extraction + pair primary) and
+`anthropic/claude-opus-4.8` (verify) when extraction quality matters again. Slugs
+confirmed live against `https://openrouter.ai/api/v1/models` on 2026-06-07; re-confirm
+at deploy time (dated slugs can be retired). Quality risk: a cheap model may raise
+the `pair classification skipped` (invalid-JSON) rate — acceptable "for now".
 
 ---
 

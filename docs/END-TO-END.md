@@ -75,10 +75,19 @@ with a trust tier:
 The expensive part is Phase B, so spend is shaped two ways:
 
 **Model tiering (cheap primary, premium gate).**
-- `EXTRACTION_MODEL` = `anthropic/claude-sonnet-4.6` — Stage A.
-- `PAIR_MODEL` = `anthropic/claude-sonnet-4.6` — Stage B **primary** (Sonnet runs on every
+> **Temporary override (2026-06-07):** to hold spend near zero during ingest
+> stabilization (and while the discounted Anthropic batch path is down for lack of
+> account credits), the OpenRouter sync models are pointed at the cheapest reliable
+> structured-output tiers — `EXTRACTION_MODEL` / `PAIR_MODEL` =
+> `deepseek/deepseek-v4-flash-20260423`, `PAIR_VERIFY_MODEL` =
+> `google/gemini-3.1-flash-lite-20260507` (kept a *different family* from the
+> primary so the trust gate stays independent). Restore the Sonnet/Opus tiers below
+> when extraction quality matters again. The `BATCH_*` (Anthropic-direct) ids are
+> unchanged. The design intent is unchanged and described as-designed below.
+- `EXTRACTION_MODEL` (as designed) = `anthropic/claude-sonnet-4.6` — Stage A.
+- `PAIR_MODEL` (as designed) = `anthropic/claude-sonnet-4.6` — Stage B **primary** (Sonnet runs on every
   pair; Opus was demoted off the primary — that was the cost driver).
-- `PAIR_VERIFY_MODEL` = `anthropic/claude-opus-4.8` — the **trust gate** only. The premium
+- `PAIR_VERIFY_MODEL` (as designed) = `anthropic/claude-opus-4.8` — the **trust gate** only. The premium
   budget is spent *exclusively* re-checking high-confidence pairs before they become hard
   constraints — the highest-blast-radius decision. Different model from the primary, so
   agreement is genuine independence.

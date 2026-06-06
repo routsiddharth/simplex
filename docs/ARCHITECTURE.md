@@ -319,7 +319,14 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   - **Tiering.** The primary pass is Sonnet (`PAIR_MODEL`), not Opus —
     Opus-on-every-pair was the biggest line item. Opus (`PAIR_VERIFY_MODEL`) is
     spent *only* as the independent verifier on the ≥0.85 band. Stage A semantics
-    stay on Sonnet (`EXTRACTION_MODEL`).
+    stay on Sonnet (`EXTRACTION_MODEL`). **Temporary override (2026-06-07):** these
+    three OpenRouter (sync) ids are currently pointed at the *cheapest reliable*
+    structured-output models (`deepseek/deepseek-v4-flash-…` primary/Stage-A; a
+    different-family `google/gemini-3.1-flash-lite-…` for the independent verify) to
+    near-zero spend during ingest stabilization while the Anthropic batch path is
+    creditless — restore the Sonnet/Opus tiers when extraction quality matters. The
+    tiering *design* (cheap primary, independent premium gate) is unchanged; only
+    the slugs in `constants.py` differ for now.
   - **Time-to-resolution gate (`pair_candidates.route_pair`).** An edge's useful
     life is `min(life of A, life of B)` — it dies when *either* endpoint settles
     (the graph is pruned 1h after resolution). So each candidate is gated on
