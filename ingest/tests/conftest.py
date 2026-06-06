@@ -8,12 +8,16 @@ file initialized from the real ``schema.sql``.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
+import websockets
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from simplex_ingest.db import Database
 from simplex_ingest.discovery_predicates import EventStats, SeriesStats
+from simplex_ingest.kalshi.auth import KalshiSigner
 from simplex_ingest.llm import LLMError, MarketSemantics, PairClassification
 from simplex_ingest.runtime import Heartbeats
 
@@ -106,12 +110,15 @@ def make_series_stats():
 # -- fake REST + runtime (for the discovery loop) ---------------------------
 
 class FakeREST:
-    """Minimal stand-in for KalshiREST.get_events over in-memory events."""
+    """Minimal stand-in for KalshiREST over in-memory events + orderbooks."""
 
-    def __init__(self, events=None, raise_exc=None):
+    def __init__(self, events=None, raise_exc=None, orderbooks=None):
         self.events = list(events or [])
         self.raise_exc = raise_exc
+        # ticker -> raw orderbook_fp dict ({"yes": [[p, s], ...], "no": [...]})
+        self.orderbooks = dict(orderbooks or {})
         self.calls = 0
+        self.orderbook_calls = 0
 
     async def get_events(self, status="open", series_ticker=None,
                          with_nested_markets=False, limit=200):
@@ -122,11 +129,131 @@ class FakeREST:
             return [e for e in self.events if e.get("series_ticker") == series_ticker]
         return list(self.events)
 
+    async def get_orderbook(self, ticker, depth):
+        self.orderbook_calls += 1
+        return self.orderbooks.get(ticker, {"yes": [], "no": []})
+
 
 @pytest.fixture
 def make_fake_rest():
-    def _make(events=None, raise_exc=None):
-        return FakeREST(events=events, raise_exc=raise_exc)
+    def _make(events=None, raise_exc=None, orderbooks=None):
+        return FakeREST(events=events, raise_exc=raise_exc, orderbooks=orderbooks)
+
+    return _make
+
+
+# -- Kalshi WS message factories + a real local WS server -------------------
+# These build the on-the-wire envelope KalshiSubscriber.parse() expects, so a
+# test can drive the REAL WebSocketLoop through an actual socket.
+
+def ws_snapshot(ticker, yes, no, seq, ts_ms=1_700_000_000_000):
+    return {"type": "orderbook_snapshot", "sid": 1, "seq": seq,
+            "msg": {"market_ticker": ticker, "yes_dollars_fp": yes,
+                    "no_dollars_fp": no, "ts_ms": ts_ms}}
+
+
+def ws_delta(ticker, side, price, delta, seq, ts_ms=1_700_000_001_000):
+    return {"type": "orderbook_delta", "sid": 1, "seq": seq,
+            "msg": {"market_ticker": ticker, "side": side, "price_dollars": price,
+                    "delta_fp": delta, "ts_ms": ts_ms}}
+
+
+def ws_trade(ticker, price, count, seq, ts_ms=1_700_000_002_000):
+    return {"type": "trade", "sid": 1, "seq": seq,
+            "msg": {"market_ticker": ticker, "yes_price_dollars": price,
+                    "no_price_dollars": round(1 - price, 2), "count_fp": count,
+                    "taker_side": "yes", "ts_ms": ts_ms}}
+
+
+def ws_lifecycle(ticker, event_type="open", seq=1, ts=1_700_000_000):
+    return {"type": "market_lifecycle_v2", "sid": 1, "seq": seq,
+            "msg": {"market_ticker": ticker, "event_type": event_type, "ts": ts}}
+
+
+class FakeKalshiWSServer:
+    """A local websockets server speaking the Kalshi control envelope.
+
+    On each ``subscribe`` it replies with a ``subscribed`` frame (assigning a
+    fresh sid) and then pushes scripted market-data frames for the requested
+    tickers/channels — a snapshot + one delta on the orderbook channel, one
+    trade on the trade channel. ``unsubscribe``/``update_subscription`` get the
+    matching control acks so the loop's sid bookkeeping stays consistent.
+    """
+
+    def __init__(self):
+        self.received: list[dict] = []   # every command the loop sent us
+        self._server = None
+        self.port: int | None = None
+        self._sid = 0
+
+    async def start(self):
+        self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.port}"
+
+    async def _handler(self, ws):
+        async for raw in ws:
+            try:
+                cmd = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            self.received.append(cmd)
+            await self._respond(ws, cmd)
+
+    async def _respond(self, ws, cmd):
+        c, mid = cmd.get("cmd"), cmd.get("id")
+        if c == "subscribe":
+            self._sid += 1
+            await ws.send(json.dumps({"type": "subscribed", "id": mid, "msg": {"sid": self._sid}}))
+            params = cmd.get("params") or {}
+            channels = params.get("channels") or []
+            tickers = params.get("market_tickers") or []
+            if "orderbook_delta" in channels:
+                for t in tickers:
+                    await ws.send(json.dumps(ws_snapshot(t, [[0.40, 100], [0.38, 50]], [[0.55, 80]], seq=1)))
+                    await ws.send(json.dumps(ws_delta(t, "yes", 0.41, 30, seq=2)))
+            if "trade" in channels:
+                for t in tickers:
+                    await ws.send(json.dumps(ws_trade(t, 0.41, 5, seq=1)))
+            if "market_lifecycle_v2" in channels:
+                for t in tickers:
+                    await ws.send(json.dumps(ws_lifecycle(t)))
+        elif c == "unsubscribe":
+            await ws.send(json.dumps({"type": "unsubscribed", "id": mid, "msg": {}}))
+        elif c == "update_subscription":
+            await ws.send(json.dumps({"type": "ok", "id": mid, "msg": {}}))
+
+    async def stop(self):
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+@pytest.fixture
+async def ws_server():
+    """A started FakeKalshiWSServer, torn down after the test."""
+    server = await FakeKalshiWSServer().start()
+    try:
+        yield server
+    finally:
+        await server.stop()
+
+
+# -- RSA signer (for auth / rest / ws connect-header tests) -----------------
+
+@pytest.fixture
+def rsa_key():
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture
+def make_signer(rsa_key):
+    def _make(key_id="test-key-id"):
+        return KalshiSigner(key_id, rsa_key)
 
     return _make
 
@@ -211,3 +338,33 @@ def make_fake_llm():
         )
 
     return _make
+
+
+# -- live-deployment tests (opt-in) -----------------------------------------
+# Tests marked `live` hit the real Railway deployment (network required). They
+# are skipped by default so the suite stays hermetic; enable with --run-live.
+
+LIVE_BASE_URL = "https://simplex-production-f4ee.up.railway.app"
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-live", action="store_true", default=False,
+        help="run @pytest.mark.live tests against the live Railway deployment",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "live: hits the live Railway deployment (needs network; opt-in via --run-live)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-live"):
+        return
+    skip_live = pytest.mark.skip(reason="needs --run-live (hits live Railway)")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)

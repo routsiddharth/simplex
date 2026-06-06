@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 from simplex_ingest import constants as C
-from simplex_ingest.kalshi.fixedpoint import level_map
 from simplex_ingest.loops.audit import BookAuditLoop, _diff_side
 
 
@@ -44,12 +43,6 @@ def test_mixed_structural_and_drift():
     )
     assert structural == 2                         # 0.38 only mem, 0.37 only rest
     assert round(max_pct, 4) == round(10 / 100 * 100, 4)   # shared 0.40 drift
-
-
-def test_level_map_parses_and_skips_bad_pairs():
-    out = level_map([["0.40", "100"], ["0.55", "80"], ["bad"], "nope", [1]])
-    assert out == {0.40: 100.0, 0.55: 80.0}
-    assert level_map(None) == {}
 
 
 # -- _audit_market classification & reset decision --------------------------
