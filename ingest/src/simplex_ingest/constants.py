@@ -325,26 +325,30 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 """OpenRouter's OpenAI-compatible API root. Not a secret (the API *key* is, and
 lives in the env per config.py)."""
 
-EXTRACTION_MODEL = "anthropic/claude-sonnet-4.6"
-"""Stage A (per-market semantics): high-volume, runs once per market then caches,
-so a fast/cheap reasoning tier fits. Confirm the exact slug against OpenRouter's
-model catalog at deploy time."""
+EXTRACTION_MODEL = "deepseek/deepseek-v4-flash-20260423"
+"""Stage A (per-market semantics): high-volume, runs once per market then caches.
+**Temporary cost measure (2026-06-07):** pointed at the cheapest reliable
+structured-output model on OpenRouter (~$0.10/M in) instead of Sonnet, to hold
+spend near zero while the ingest is being stabilized and the discounted Anthropic
+batch path is unavailable (no account credits). Restore a stronger tier
+(`anthropic/claude-sonnet-4.6`) once extraction quality matters again. Confirm the
+exact slug against OpenRouter's model catalog at deploy time. (OpenRouter dotted id.)"""
 
-PAIR_MODEL = "anthropic/claude-sonnet-4.6"
-"""Stage B primary (pair relationship). Demoted from Opus to Sonnet in the LLM
-cost migration: Opus-on-every-candidate-pair was the single biggest line item,
-and Sonnet holds the taxonomy classification well enough that the strongest tier
-is better spent only on the trust gate (see PAIR_VERIFY_MODEL). This is the
-cost *rate* lever — it lands before any batch routing. (OpenRouter dotted id.)"""
+PAIR_MODEL = "deepseek/deepseek-v4-flash-20260423"
+"""Stage B primary (pair relationship). **Temporary cost measure (2026-06-07):**
+same cheapest-reliable model as EXTRACTION_MODEL (was `anthropic/claude-sonnet-4.6`).
+This is the cost *rate* lever — it lands before any batch routing. Restore Sonnet
+when extraction quality matters again. (OpenRouter dotted id.)"""
 
-PAIR_VERIFY_MODEL = "anthropic/claude-opus-4.8"
+PAIR_VERIFY_MODEL = "google/gemini-3.1-flash-lite-20260507"
 """Independent second opinion used ONLY to promote a high-confidence edge to the
-`trusted` (hard-constraint) tier. Deliberately a *different* model from
-PAIR_MODEL so agreement is genuine independence, not one model agreeing with
-itself. With Sonnet now the primary, Opus moves here: it guards exactly the
-highest-blast-radius decision (a wrong hard constraint) while running only on the
-low-volume ≥EDGE_TRUSTED_CONFIDENCE band, not every pair. Disagreement demotes
-the edge to the manual-review queue. (OpenRouter dotted id.)"""
+`trusted` (hard-constraint) tier. Must be a *different* model from PAIR_MODEL so
+agreement is genuine independence, not one model agreeing with itself (same-model
+verification would flood the trusted tier). **Temporary cost measure
+(2026-06-07):** a cheap *different-family* model (Gemini Flash-Lite) rather than
+Opus — it still cross-checks the low-volume ≥EDGE_TRUSTED_CONFIDENCE band from an
+independent model, just far cheaper. Restore `anthropic/claude-opus-4.8` when the
+trusted tier needs the strongest guard. (OpenRouter dotted id.)"""
 
 EXTRACTION_PROMPT_VERSION = 1
 """Cache key for both tables. Bump when the prompts/output schema change so the
