@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 
 from .. import constants as C
@@ -39,34 +40,97 @@ class SnapshotBuilder:
         self._active: set[str] = set()
         self._active_status: dict[str, str | None] = {}
         self._last_checkpoint = 0.0
+        # Metrics (rolled up every METRICS_LOG_INTERVAL_SECONDS by the applier).
+        self._events_applied = 0
+        self._events_at_mark = 0
+        self._metrics_at = 0.0
+        self._sample_ms_sum = 0.0
+        self._sample_count = 0
+        self._last_sample_ms = 0.0
 
     async def run(self) -> None:
         # Load checkpoints once; markets are seeded from them lazily as they
         # appear in the active set.
         self._checkpoints = await asyncio.to_thread(self.rt.db.load_book_states)
         log.info("loaded checkpoints", extra={"markets": len(self._checkpoints)})
-        self._last_checkpoint = now_utc().timestamp()
+        now = now_utc().timestamp()
+        self._last_checkpoint = now
+        self._metrics_at = now
 
+        # Establish the active set + replay cursor once so the first grid sample
+        # already sees seeded books, then run two cooperating tasks on this loop:
+        #
+        #   applier  — drains raw_events into the books continuously, in small
+        #              yielding chunks (book-keeping decoupled from the grid).
+        #   sampler  — every SNAPSHOT_INTERVAL_SECONDS reads the *current* books
+        #              into one grid row per active market and upserts them.
+        #
+        # Splitting "keep books current" from "emit the grid" means a heavy drain
+        # (e.g. a market mid-resync) never delays the 10s grid, and neither side
+        # ever monopolizes the event loop past the WS ping deadline. Both run on
+        # the one event loop, so the sampler's synchronous per-market read can
+        # never observe a half-applied book — no locks needed.
+        await self._refresh_active()
+
+        applier = asyncio.create_task(self._apply_loop(), name="snapshot-applier")
+        sampler = asyncio.create_task(self._sample_loop(), name="snapshot-sampler")
+        try:
+            done, _ = await asyncio.wait(
+                {applier, sampler}, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in done:
+                task.result()  # re-raise so the supervisor restarts the loop
+        finally:
+            for task in (applier, sampler):
+                task.cancel()
+            await asyncio.gather(applier, sampler, return_exceptions=True)
+
+    # -- applier: keep the books near-current from raw_events ---------------
+
+    async def _apply_loop(self) -> None:
         while not self.rt.shutdown.is_set():
-            now = now_utc()
-            boundary = floor_to_interval(now, C.SNAPSHOT_INTERVAL_SECONDS) + _interval()
+            await self._refresh_active()
+            await self._drain_events()
+            await self._maybe_checkpoint()
+            self.rt.heartbeats.beat(self.name)
+            self._maybe_log_metrics()
+            # Idle briefly when caught up; RAW_EVENT_FLUSH_SECONDS (1s) > this, so
+            # freshly-flushed events are picked up promptly.
+            if not await idle_sleep(
+                self.rt.shutdown, self.rt.heartbeats, self.name,
+                C.SNAPSHOT_APPLIER_POLL_SECONDS, step=C.SNAPSHOT_APPLIER_POLL_SECONDS,
+            ):
+                break  # shutdown fired
+
+    # -- sampler: emit the SNAPSHOT_INTERVAL_SECONDS grid -------------------
+
+    async def _sample_loop(self) -> None:
+        while not self.rt.shutdown.is_set():
+            boundary = floor_to_interval(now_utc(), C.SNAPSHOT_INTERVAL_SECONDS) + _interval()
             secs = (naive_utc(boundary) - naive_utc(now_utc())).total_seconds()
             # step=5s: beat more often than the other loops so the tighter grid
             # boundary stays liveness-safe.
             if not await idle_sleep(self.rt.shutdown, self.rt.heartbeats, self.name, secs, step=5.0):
                 break  # shutdown fired
             try:
-                await self.tick(window_end=boundary)
+                await self._emit(window_end=boundary)
             except Exception:
-                log.exception("snapshot tick failed")
+                log.exception("snapshot emit failed")
             self.rt.heartbeats.beat(self.name)
-            await self._maybe_checkpoint()
 
-    # -- one grid tick ------------------------------------------------------
+    # -- one full cycle (tests / dry run) -----------------------------------
 
     async def tick(self, window_end: datetime) -> None:
-        window_start = window_end - _interval()
+        """Refresh the active set, drain pending events, and emit one grid in a
+        single synchronous pass. ``run()`` splits these across the applier and
+        sampler; this keeps a single-call entry point for tests and dry runs."""
+        await self._refresh_active()
+        await self._drain_events()
+        await self._emit(window_end=window_end)
 
+    # -- active set + seeding -----------------------------------------------
+
+    async def _refresh_active(self) -> None:
         markets = await asyncio.to_thread(self.rt.db.get_active_markets)
         self._active = {m["market_id"] for m in markets}
         self._active_status = {m["market_id"]: m["status"] for m in markets}
@@ -76,16 +140,21 @@ class SnapshotBuilder:
         self._seeded &= self._active
         await self._seed_new_markets()
 
-        await self._drain_events()
+    # -- emit one grid ------------------------------------------------------
 
+    async def _emit(self, window_end: datetime) -> None:
+        window_start = window_end - _interval()
         volumes = await asyncio.to_thread(
             self.rt.db.window_trade_volume, window_start, window_end
         )
 
+        started = time.monotonic()
         rows: list[tuple] = []
         built = naive_utc(now_utc())
         ts = naive_utc(window_end)
-        for market in self._active:
+        # Snapshot the active set: the applier may rebind self._active mid-build.
+        active = tuple(self._active)
+        for i, market in enumerate(active):
             r = self.rt.book_store.get_or_create(market)
             yes_bid, yes_ask, yes_mid = r.top_of_book()
             bid_depth, ask_depth, bid_levels, ask_levels = r.depth_within(
@@ -101,9 +170,34 @@ class SnapshotBuilder:
                 )
             )
             self._run_canaries(market, r, window_end)
+            # Yield between markets (never mid-row) so a large active set can't
+            # monopolize the event loop; each emitted row stays self-consistent.
+            if (i + 1) % C.SNAPSHOT_ROW_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
 
         await asyncio.to_thread(self.rt.db.upsert_snapshots, rows)
+        self._last_sample_ms = (time.monotonic() - started) * 1000.0
+        self._sample_ms_sum += self._last_sample_ms
+        self._sample_count += 1
         log.info("snapshots emitted", extra={"ts": ts.isoformat(), "markets": len(rows)})
+
+    def _maybe_log_metrics(self) -> None:
+        now = now_utc().timestamp()
+        elapsed = now - self._metrics_at
+        if elapsed < C.METRICS_LOG_INTERVAL_SECONDS:
+            return
+        applied = self._events_applied - self._events_at_mark
+        mean_ms = round(self._sample_ms_sum / self._sample_count, 1) if self._sample_count else 0.0
+        log.info(
+            "snapshot metrics",
+            extra={"events_per_s": round(applied / elapsed, 1),
+                   "mean_sample_ms": mean_ms, "last_sample_ms": round(self._last_sample_ms, 1),
+                   "books": len(self.rt.book_store.markets), "active": len(self._active)},
+        )
+        self._metrics_at = now
+        self._events_at_mark = self._events_applied
+        self._sample_ms_sum = 0.0
+        self._sample_count = 0
 
     def _run_canaries(self, market: str, r, window_end: datetime) -> None:
         reset = r.reset_canaries()
@@ -161,10 +255,17 @@ class SnapshotBuilder:
             )
             if not batch:
                 return
-            for e in batch:
+            for i, e in enumerate(batch):
                 self._apply_event(e)
                 self._cursor_ts = e["received_ts"]
                 self._cursor_rowid = e["rowid"]
+                self._events_applied += 1
+                # Cooperative yield: lets the WS keepalive (ping/pong) and the
+                # other loops get scheduled so a large drain can never starve the
+                # connection past the ping deadline. The cursor advances per
+                # event, so a yield/cancel resumes exactly where it left off.
+                if (i + 1) % C.SNAPSHOT_APPLY_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
             if len(batch) < _FETCH_LIMIT:
                 return
 

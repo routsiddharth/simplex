@@ -146,6 +146,16 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   markets via REST, keeps tradeable markets above `CATALOG_MIN_MARKET_VOLUME`,
   upserts the `markets` catalog, sets the **active subscription set**
   (`subscribed = TRUE`), and signals the WS loop (`resubscribe_event`).
+- **Bounds *markets*, not just series.** `MAX_TRACKED_SERIES` caps the series
+  count, but a high-cardinality series (an election primary fans out to hundreds
+  of candidate sub-markets) breaks the "a series is a handful of markets"
+  assumption that the firehose budget rests on. After fan-out the poller applies
+  `MAX_ACTIVE_MARKETS` as a hard ceiling, keeping the highest-**volume** markets
+  (the value the coherence engine cares about) and dropping the low-liquidity
+  tail. It also logs the live active-market **volume distribution** each refresh
+  (`catalog volume distribution`) so `CATALOG_MIN_MARKET_VOLUME` can be set from
+  data rather than guessed — the distribution can't be sampled out-of-band
+  because DuckDB is single-writer while the process holds the lock.
 - **Soft-fails** on an empty tracked set (logs, WS stays idle) — there is no
   longer a fatal allowlist startup gate.
 - Closed/removed markets keep their rows and history; only `subscribed` flips.
@@ -158,20 +168,47 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 - Reconciles **incrementally** on the catalog signal (subscribe/unsubscribe per
   market for orderbook; `update_subscription` add/delete for bulk channels) —
   never a full reconnect. Dropping a market also drops its `BookStore` entry.
-- Parses each message into `NormalizedEvent`s and buffers them to `raw_events`
-  (batched). Reconnects with exponential backoff + jitter, unbounded.
+- Parses each message (`orjson`, ~3–5× faster decode than stdlib `json` to free
+  the event loop sooner on the firehose) into `NormalizedEvent`s and buffers them
+  to `raw_events` (batched). Reconnects with exponential backoff + jitter,
+  unbounded; a full reconnect re-subscribes the entire active set
+  (`_subscribe_initial`). Rolls up `ws metrics` (frames/s, reconnect / reconcile
+  / reset counts) every `METRICS_LOG_INTERVAL_SECONDS`.
 - Drains **book-reset requests** (from the snapshot builder on a gap/canary, or
   the audit loop on a large diff): re-subscribes that one market's orderbook to
   force a fresh snapshot.
+- **Scaling note (planned, not built):** a single connection carrying the whole
+  firehose is the reconnect blast-radius risk — one drop re-anchors every book.
+  Sharding the orderbook subscriptions across N connections (by series), all
+  feeding the one in-process `raw_events` writer, would localize a drop to its
+  shard while keeping the single-writer invariant. Deferred until the
+  applier/sampler yields are confirmed insufficient in production (see §11).
 
 ### Snapshot builder (`loops/snapshots.py`)
 - **Cadence:** emits on the `SNAPSHOT_INTERVAL_SECONDS` (10 s) grid boundary.
+- **Applier / sampler split.** `run()` drives two cooperating tasks on the one
+  event loop rather than a single per-tick burst:
+  - the **applier** continuously drains new `raw_events` into the books in small
+    chunks, yielding (`await asyncio.sleep(0)`) every `SNAPSHOT_APPLY_YIELD_EVERY`
+    events so a large backlog can never monopolize the loop past the WS keepalive
+    deadline (a missed-ping disconnect becomes structurally impossible on one
+    core, independent of market count);
+  - the **sampler** wakes each 10 s boundary and only *reads* the current books
+    into one grid row per active market (yielding every `SNAPSHOT_ROW_YIELD_EVERY`
+    markets, **between markets**), then upserts. It does no draining, so a heavy
+    apply (e.g. a market mid-resync) never delays the grid.
+  Both run on the single event loop, so the sampler's synchronous per-market read
+  can never observe a half-applied book — no locks. The synchronous full-cycle
+  `tick()` (refresh → drain → emit) is retained as the entry point for tests and
+  the dry run. Per-loop metrics (`snapshot metrics`: events/s, sample-build
+  duration, book/active counts) roll up every `METRICS_LOG_INTERVAL_SECONDS`;
+  sample-build duration is the leading indicator of the loop getting slow.
 - Replays `raw_events` in ingest order, forwarding each to that market's
   **`BookReconstructor`** (`reconstruct.py`) — a deep per-market state machine
-  that owns the sequence discipline (§6). Every tick emits one row per active
-  market to `snapshots` (top-of-book, within-band depth, window trade volume,
-  last trade, status), carrying the book forward (LOCF) for quiet markets.
-  Idempotent on `(ts, platform, market_id)`.
+  that owns the sequence discipline (§6). Each grid sample emits one row per
+  active market to `snapshots` (top-of-book, within-band depth, window trade
+  volume, last trade, status), carrying the book forward (LOCF) for quiet
+  markets. Idempotent on `(ts, platform, market_id)`.
 - **Anchoring & gaps:** deltas apply only after a snapshot anchors the book; a
   `seq` gap discards that market's book and requests a fresh snapshot.
 - **Checkpoints** every `CHECKPOINT_INTERVAL_SECONDS` (60 s) to `book_state`
@@ -189,8 +226,18 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   deliberate Stage-1 simplification — the grid is fully regenerable from
   `raw_events`, so dense re-materialization can be added later (alongside the
   planned R2/Parquet export, §11) without changing the ingest.
-- **Canaries** (per market, per tick): `crossed_book`, `negative_size`,
+- **Canaries** (per market, per sample): `crossed_book`, `negative_size`,
   `out_of_range_price` force a book reset; a stale-market check is informational.
+- **Out-of-range levels are excluded at apply time.** A resting level priced
+  outside the tradeable band (`CANARY_PRICE_MIN_USD`..`CANARY_PRICE_MAX_USD`,
+  i.e. 1¢–99¢) is not a valid order — e.g. a near-decided primary candidate
+  resting at 0¢/100¢. `BookReconstructor` drops such levels (snapshot and delta)
+  before they enter the book, logging the first offending price per market
+  (`dropping out-of-range level`) for diagnosis. This keeps the book valid
+  instead of letting the level trip `out_of_range_price` into an endless
+  reset/re-anchor loop. The canary remains as a backstop (it can no longer fire
+  for these, since the level never enters) — detectors are *not* softened; the
+  book is built correctly.
 
 ### Book audit (`loops/audit.py`)
 - **Cadence:** wakes every `AUDIT_TICK_SECONDS` (1 h); runs a pass only when the

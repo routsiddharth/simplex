@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
     "sortedcontainers>=2.4",
+    "orjson>=3.9",
 ]
 
 [project.optional-dependencies]

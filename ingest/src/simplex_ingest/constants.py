@@ -36,6 +36,28 @@ Smaller = less replay work after a restart but more write churn. The builder
 also checkpoints on clean shutdown regardless of this value, so this only
 bounds the *crash* replay window."""
 
+SNAPSHOT_APPLIER_POLL_SECONDS = 0.5
+"""How long the snapshot *applier* idles when it has drained all pending
+``raw_events`` and is caught up. The applier runs continuously (separate from
+the 10s grid *sampler*), draining new events in small yielding chunks; when
+there's nothing new it polls at this cadence. Kept well under
+``RAW_EVENT_FLUSH_SECONDS`` (1s) so freshly-flushed events are applied promptly,
+keeping the books near-current for the sampler."""
+
+SNAPSHOT_APPLY_YIELD_EVERY = 500
+"""Cooperative-yield granularity inside the applier's event-apply loop: after
+this many events applied, ``await asyncio.sleep(0)`` to let the event loop
+service the WebSocket keepalive (ping/pong) and other loops. This is what makes
+a missed-ping disconnect structurally impossible on one core regardless of the
+event backlog — the apply burst can never monopolize the loop past the ping
+deadline."""
+
+SNAPSHOT_ROW_YIELD_EVERY = 500
+"""Cooperative-yield granularity inside the sampler's row-build loop: yield
+after this many markets, **between markets, never mid-market**, so every emitted
+snapshot row stays internally consistent while the build still can't monopolize
+the event loop at a large active-market count."""
+
 DEPTH_BAND_PRICE_UNITS = 0.03
 """Half-width of the depth band, in dollars. ``bid_depth_3c_usd`` /
 ``ask_depth_3c_usd`` sum (price x size) for resting orders within this many
@@ -59,7 +81,28 @@ of discovery's latest tracked set against REST budget."""
 CATALOG_MIN_MARKET_VOLUME = 0.0
 """Liquidity floor (contracts) for a market to enter the active set. 0.0 keeps
 every open market in a tracked series. Raise to prune dead markets and shrink
-the WS firehose. Applied in the catalog poller."""
+the WS firehose. Applied in the catalog poller.
+
+Still 0.0 deliberately: the right floor is set from the live volume distribution
+the catalog poller now logs each refresh (``catalog volume distribution`` — see
+``CatalogPoller._log_volume_distribution``). Read the percentiles off a deploy,
+then raise this to drop the near-zero-liquidity primary candidate markets that
+carry no coherence signal. Until then nothing is silently cut on liquidity."""
+
+MAX_ACTIVE_MARKETS = 6000
+"""Hard ceiling on the active-market count *after* series→market fan-out, applied
+in the catalog poller. ``MAX_TRACKED_SERIES`` bounds the *series* count, but a
+high-cardinality series (an election primary fans out to hundreds of candidate
+sub-markets) breaks the implicit "a series is a handful of markets" assumption
+and drives the WS firehose load. This bounds *markets* directly: when fan-out
+exceeds the ceiling, markets are kept greedily by volume (highest first) and the
+remainder dropped — capping the firehose by the value the coherence engine cares
+about rather than by arbitrary truncation.
+
+Set as a backstop above the current live count (~5.4k) so it does not bite today;
+tighten it (with ``CATALOG_MIN_MARKET_VOLUME``) once the logged volume
+distribution shows where the signal-bearing markets end. Cap *markets*, not
+series."""
 
 
 # --------------------------------------------------------------------------
@@ -469,3 +512,11 @@ off the faster loops)."""
 LOG_LEVEL = "INFO"
 """Root log level. DEBUG is very chatty (per-event, per-delta). Structured
 JSON lines go to stdout; the platform collects them."""
+
+METRICS_LOG_INTERVAL_SECONDS = 60.0
+"""How often the hot-path loops emit a rolled-up metrics line (``snapshot
+metrics`` / ``ws metrics``): applied-events/sec, parsed-frames/sec, mean/last
+sample-build duration, reconnect + resync counts. Tick/sample duration is the
+single most useful signal — it shows the worker getting slow *before* a
+connection dies. Rolled up at this cadence rather than per-tick to keep the log
+greppable."""

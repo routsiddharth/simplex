@@ -90,3 +90,27 @@ async def test_refresh_persists_metadata_and_retires_dropped_market(
     with tmp_db._lock:
         ids = {r[0] for r in tmp_db._con.execute("SELECT market_id FROM markets").fetchall()}
     assert ids == {"KXCAT-A", "KXCAT-B"}  # B's history is kept
+
+
+async def test_ceiling_keeps_highest_volume_markets(
+    tmp_db, make_fake_rest, make_event, make_market, monkeypatch
+):
+    """When fan-out exceeds MAX_ACTIVE_MARKETS, the highest-volume markets are
+    kept and the low-liquidity tail is dropped — cap markets, not series."""
+    from simplex_ingest import constants as C
+
+    monkeypatch.setattr(C, "MAX_ACTIVE_MARKETS", 2)
+    tmp_db.replace_tracked_series([_tracked_row("KXCAT")])
+    rest = make_fake_rest(events=[make_event(
+        series="KXCAT", mutex=True,
+        markets=[
+            make_market("KXCAT-LO", status="active", subtitle="lo", volume=5.0),
+            make_market("KXCAT-HI", status="active", subtitle="hi", volume=900.0),
+            make_market("KXCAT-MID", status="active", subtitle="mid", volume=100.0),
+        ],
+    )])
+    rt = _catalog_runtime(tmp_db, rest)
+
+    await CatalogPoller(rt).refresh()
+    # Ceiling=2: HI (900) and MID (100) survive; LO (5) is dropped over the cap.
+    assert tmp_db.get_active_market_ids() == {"KXCAT-HI", "KXCAT-MID"}

@@ -18,11 +18,12 @@ import json
 import ssl
 
 import certifi
+import orjson
 from websockets.asyncio.client import connect
 
 from .. import constants as C
 from ..log import get_logger
-from ..util import Backoff
+from ..util import Backoff, now_utc
 
 log = get_logger("ws")
 
@@ -38,6 +39,15 @@ class WebSocketLoop:
         # websockets doesn't pick up certifi's CA bundle by default (httpx does);
         # supply one explicitly so the wss handshake verifies.
         self._ssl = ssl.create_default_context(cafile=certifi.where())
+        # Process-lifetime metric counters (NOT reset per connection) — see
+        # _maybe_log_metrics. reconnects = full re-subscribes; reconciles =
+        # incremental catalog diffs; resets = per-market re-anchors.
+        self._frames = 0
+        self._reconnects = 0
+        self._reconciles = 0
+        self._resets = 0
+        self._metrics_at = now_utc().timestamp()
+        self._frames_at_mark = 0
         self._reset_conn_state()
 
     def _reset_conn_state(self) -> None:
@@ -86,6 +96,7 @@ class WebSocketLoop:
         ) as ws:
             self._ws = ws
             self._reset_conn_state()
+            self._reconnects += 1
             self.rt.heartbeats.beat(self.name)
             await self._subscribe_initial(ws)
 
@@ -109,8 +120,12 @@ class WebSocketLoop:
     async def _reader(self, ws) -> None:
         async for raw in ws:
             self.rt.heartbeats.beat(self.name)
+            self._frames += 1
             try:
-                message = json.loads(raw)
+                # orjson decodes ~3-5x faster than stdlib json, freeing the event
+                # loop sooner on the firehose (orjson.JSONDecodeError subclasses
+                # ValueError, so the handling below is unchanged).
+                message = orjson.loads(raw)
             except (ValueError, TypeError):
                 log.warning("ws non-JSON message dropped")
                 continue
@@ -150,6 +165,7 @@ class WebSocketLoop:
             await asyncio.sleep(C.RAW_EVENT_FLUSH_SECONDS)
             await asyncio.to_thread(self.rt.db.flush_raw_events)
             self.rt.heartbeats.beat(self.name)
+            self._maybe_log_metrics()
 
             if self.rt.resubscribe_event.is_set():
                 self.rt.resubscribe_event.clear()
@@ -207,6 +223,7 @@ class WebSocketLoop:
         await self._update_bulk(ws, self._lifecycle_sid, C.WS_CHANNEL_LIFECYCLE, "lifecycle", to_add, to_remove, desired)
 
         self._current = set(desired)
+        self._reconciles += 1
         log.info("ws reconciled", extra={"added": len(to_add), "removed": len(to_remove)})
 
     async def _update_bulk(self, ws, sid, channel, kind, to_add, to_remove, desired) -> None:
@@ -233,4 +250,22 @@ class WebSocketLoop:
         if sid is not None:
             await self._send(ws, self.sub.unsubscribe_message(self._next_id(), [sid]))
         await self._subscribe_orderbook(ws, market)
+        self._resets += 1
         log.info("ws reset market", extra={"market": market})
+
+    # -- metrics ------------------------------------------------------------
+
+    def _maybe_log_metrics(self) -> None:
+        now = now_utc().timestamp()
+        elapsed = now - self._metrics_at
+        if elapsed < C.METRICS_LOG_INTERVAL_SECONDS:
+            return
+        frames = self._frames - self._frames_at_mark
+        log.info(
+            "ws metrics",
+            extra={"frames_per_s": round(frames / elapsed, 1),
+                   "reconnects": self._reconnects, "reconciles": self._reconciles,
+                   "resets": self._resets},
+        )
+        self._metrics_at = now
+        self._frames_at_mark = self._frames

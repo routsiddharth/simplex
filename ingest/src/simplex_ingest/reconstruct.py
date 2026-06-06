@@ -44,6 +44,7 @@ class BookReconstructor:
     __slots__ = (
         "market_id", "book", "last_sequence", "anchored", "replay_floor_ts",
         "last_trade_price", "status", "last_event_received_ts",
+        "_logged_out_of_range",
     )
 
     def __init__(self, market_id: str) -> None:
@@ -55,6 +56,10 @@ class BookReconstructor:
         self.last_trade_price: float | None = None
         self.status: str | None = None
         self.last_event_received_ts: datetime | None = None
+        # One-shot diagnostic: log the first out-of-range level we drop for this
+        # market (with its actual price) so the live logs reveal the offending
+        # value, then stay quiet — bounded markets would otherwise flood.
+        self._logged_out_of_range = False
 
     # -- checkpoint restore -------------------------------------------------
 
@@ -79,10 +84,12 @@ class BookReconstructor:
         seq = event["sequence"]
 
         if et == EventType.ORDERBOOK_SNAPSHOT.value:
-            self.book.apply_snapshot(
-                [tuple(x) for x in payload.get("yes", [])],
-                [tuple(x) for x in payload.get("no", [])],
-            )
+            yes_in, yes_out = _split_in_band(payload.get("yes", []))
+            no_in, no_out = _split_in_band(payload.get("no", []))
+            if yes_out or no_out:
+                self._note_out_of_range((yes_out or no_out)[0][0],
+                                        yes_dropped=len(yes_out), no_dropped=len(no_out))
+            self.book.apply_snapshot(yes_in, no_in)
             self.anchored = True
             self.last_sequence = seq
         elif et == EventType.ORDERBOOK_DELTA.value:
@@ -102,7 +109,14 @@ class BookReconstructor:
             price = payload.get("price")
             delta = payload.get("delta")
             if side in ("yes", "no") and price is not None and delta is not None:
-                self.book.apply_delta(side, price, delta)
+                if _in_band(price):
+                    self.book.apply_delta(side, price, delta)
+                else:
+                    # A delta at a non-tradeable (0c/100c-ish) price: the level was
+                    # never stored (snapshots filter it too), so dropping the delta
+                    # keeps the book consistent rather than letting an out-of-range
+                    # level resurrect and trip the canary into an endless reset.
+                    self._note_out_of_range(price, side=side)
             if seq is not None:
                 self.last_sequence = seq
         elif et == EventType.TRADE.value:
@@ -119,6 +133,24 @@ class BookReconstructor:
         self.anchored = False
         self.last_sequence = None
 
+    def _note_out_of_range(
+        self, sample_price: float, *, side: str | None = None,
+        yes_dropped: int = 0, no_dropped: int = 0,
+    ) -> None:
+        """Log the first out-of-range level dropped for this market, with its
+        actual price, then go quiet. Lets a deploy reveal whether these are
+        legitimate 0c/100c resting levels (drop is correct) or a decode bug
+        (the logged price would be grossly off, e.g. cents-not-dollars)."""
+        if self._logged_out_of_range:
+            return
+        self._logged_out_of_range = True
+        log.warning(
+            "dropping out-of-range level",
+            extra={"market": self.market_id, "sample_price": sample_price,
+                   "side": side, "yes_dropped": yes_dropped, "no_dropped": no_dropped,
+                   "band": [C.CANARY_PRICE_MIN_USD, C.CANARY_PRICE_MAX_USD]},
+        )
+
     # -- reads --------------------------------------------------------------
 
     def top_of_book(self) -> tuple[float | None, float | None, float | None]:
@@ -133,6 +165,28 @@ class BookReconstructor:
 
     def serialize(self) -> dict[str, Any]:
         return self.book.serialize()
+
+
+_BAND_EPS = 1e-9
+
+
+def _in_band(price: float) -> bool:
+    """A resting level is tradeable iff its price is within the canary band
+    (1c..99c). Levels outside it (0c/100c extremes, or a decode glitch) are not
+    valid resting orders and are excluded from the book at apply time."""
+    return (C.CANARY_PRICE_MIN_USD - _BAND_EPS) <= price <= (C.CANARY_PRICE_MAX_USD + _BAND_EPS)
+
+
+def _split_in_band(
+    levels: list,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Partition snapshot ``[price, size]`` pairs into (in-band, out-of-band)."""
+    in_band: list[tuple[float, float]] = []
+    out_of_band: list[tuple[float, float]] = []
+    for x in levels:
+        pair = tuple(x)
+        (in_band if _in_band(pair[0]) else out_of_band).append(pair)
+    return in_band, out_of_band
 
 
 def _status_from_lifecycle(payload: dict, current: str | None) -> str | None:

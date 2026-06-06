@@ -75,9 +75,10 @@ class CatalogPoller:
             return
 
         platform = self.rt.subscriber.platform
-        active_ids: set[str] = set()
-        rows: list[tuple] = []
-        kept = 0
+        # Collect candidates as (volume, ticker, row) so we can both log the live
+        # volume distribution and apply the MAX_ACTIVE_MARKETS ceiling greedily by
+        # volume after the full series→market fan-out.
+        candidates: list[tuple[float, str, tuple]] = []
 
         for series in series_list:
             events = await self.rt.rest.get_events(
@@ -93,19 +94,55 @@ class CatalogPoller:
                 for market in event.get("markets") or []:
                     if market.get("status") not in _TRADEABLE:
                         continue
-                    if volume(market) < C.CATALOG_MIN_MARKET_VOLUME:
+                    vol = volume(market)
+                    if vol < C.CATALOG_MIN_MARKET_VOLUME:
                         continue
                     ticker = market.get("ticker")
                     if not ticker:
                         continue
-                    active_ids.add(ticker)
-                    rows.append(_market_row(market, event, platform))
-                    kept += 1
+                    candidates.append((vol, ticker, _market_row(market, event, platform)))
+
+        self._log_volume_distribution(candidates)
+
+        # Cap *markets* (not just series): a high-cardinality series can fan out
+        # to thousands of markets and break the firehose budget. Keep the highest-
+        # volume markets — the value the coherence engine cares about — and drop
+        # the long low-liquidity tail.
+        dropped = 0
+        if len(candidates) > C.MAX_ACTIVE_MARKETS:
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            dropped = len(candidates) - C.MAX_ACTIVE_MARKETS
+            candidates = candidates[: C.MAX_ACTIVE_MARKETS]
+
+        active_ids = {ticker for _, ticker, _ in candidates}
+        rows = [row for _, _, row in candidates]
 
         await asyncio.to_thread(self.rt.db.upsert_markets, rows)
         await asyncio.to_thread(self.rt.db.set_active_set, active_ids)
         self.rt.resubscribe_event.set()
         log.info(
             "catalog refreshed",
-            extra={"series": len(series_list), "active_markets": kept},
+            extra={"series": len(series_list), "active_markets": len(active_ids),
+                   "dropped_over_ceiling": dropped},
+        )
+
+    @staticmethod
+    def _log_volume_distribution(candidates: list[tuple[float, str, tuple]]) -> None:
+        """Emit the active-market volume distribution so a deliberate
+        CATALOG_MIN_MARKET_VOLUME floor can be set from live data (the floor
+        cannot be sampled out-of-band: DuckDB is single-writer while the process
+        holds the lock). Greppable as ``catalog volume distribution``."""
+        n = len(candidates)
+        if not n:
+            return
+        vols = sorted(v for v, _, _ in candidates)
+
+        def pct(p: float) -> float:
+            return round(vols[min(n - 1, int(p * n))], 1)
+
+        below = {f"lt_{t}": sum(1 for v in vols if v < t) for t in (1, 10, 100, 1000)}
+        log.info(
+            "catalog volume distribution",
+            extra={"n": n, "p50": pct(0.50), "p90": pct(0.90), "p99": pct(0.99),
+                   "max": round(vols[-1], 1), **below},
         )

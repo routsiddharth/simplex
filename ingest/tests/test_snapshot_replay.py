@@ -174,3 +174,41 @@ async def test_readmit_reseeds_after_drop(tmp_db):
     await builder.tick(window_end=now_utc())
     assert mid in builder._seeded
     assert rt.book_store.get(mid) is not None
+
+
+def _snapshot_count(db, market_id):
+    with db._lock:
+        return db._con.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE market_id = ?", [market_id]
+        ).fetchone()[0]
+
+
+async def test_run_split_applier_and_sampler(tmp_db, monkeypatch):
+    """The real run(): the continuous applier keeps the book current from
+    raw_events while the sampler emits the grid on its own cadence — exercising
+    the two-task split, not just the synchronous tick()."""
+    from simplex_ingest import constants as C
+
+    monkeypatch.setattr(C, "SNAPSHOT_INTERVAL_SECONDS", 1)  # emit ~every second
+    rt = _runtime(tmp_db)
+    mid = "MR"
+    _activate(tmp_db, mid)
+    builder = SnapshotBuilder(rt)
+
+    task = asyncio.create_task(builder.run())
+    await asyncio.sleep(0.2)  # let run() set the replay cursor at ~now
+    # Event written AFTER the cursor is established → the applier drains it.
+    _insert(tmp_db, _snap(mid, [[0.40, 100]], [[0.55, 80]], seq=1, rts=naive_utc(now_utc())))
+
+    try:
+        for _ in range(50):  # up to ~5s for the applier+sampler to do their thing
+            await asyncio.sleep(0.1)
+            if _snapshot_count(tmp_db, mid) > 0 and rt.book_store.get(mid) and rt.book_store.get(mid).anchored:
+                break
+    finally:
+        rt.shutdown.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert rt.book_store.get(mid).anchored           # applier kept the book current
+    assert _snapshot_count(tmp_db, mid) > 0          # sampler emitted the grid
+    assert builder._events_applied >= 1              # metric counter advanced

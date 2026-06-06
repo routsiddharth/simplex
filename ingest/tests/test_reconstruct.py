@@ -118,3 +118,35 @@ def test_reset_canaries_flags_crossed_book():
     # yes_bid 0.60 > yes_ask (1 - 0.50) = 0.50 -> crossed.
     r.apply(_snap([[0.60, 10]], [[0.50, 10]], seq=5))
     assert "crossed_book" in r.reset_canaries()
+
+
+# -- out-of-range levels (the CA/MD primary reset-loop fix) -----------------
+
+def test_snapshot_drops_out_of_range_levels_no_canary():
+    """A near-decided primary market resting at 0c/100c must not trip the
+    out_of_range_price canary forever: those levels are excluded at apply time so
+    the book is valid and stable, built only from the in-band levels."""
+    r = BookReconstructor("M")
+    # 1.00 (100c) on no, 0.00 (0c) on yes are non-tradeable extremes; 0.97/0.02 ok.
+    r.apply(_snap([[0.02, 10], [0.00, 99]], [[1.00, 50], [0.97, 5]], seq=5))
+    assert r.anchored
+    assert 0.0 not in r.book.yes and 0.02 in r.book.yes      # extreme dropped, valid kept
+    assert 1.0 not in r.book.no and 0.97 in r.book.no
+    assert r.reset_canaries() == set()                        # no perpetual reset
+
+
+def test_out_of_range_delta_is_dropped():
+    r = BookReconstructor("M")
+    r.apply(_snap([[0.40, 100]], [[0.55, 80]], seq=5))
+    # A delta at 100c must not resurrect an out-of-range level.
+    assert r.apply(_delta("no", 1.00, 30, seq=6)) is ApplyResult.OK
+    assert 1.0 not in r.book.no
+    assert r.reset_canaries() == set()
+    assert r.last_sequence == 6                                # seq still advances
+
+
+def test_in_band_boundary_levels_are_kept():
+    r = BookReconstructor("M")
+    # Exactly 1c and 99c are tradeable and must survive the filter.
+    r.apply(_snap([[0.01, 10]], [[0.99, 10]], seq=5))
+    assert 0.01 in r.book.yes and 0.99 in r.book.no

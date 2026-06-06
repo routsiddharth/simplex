@@ -37,7 +37,9 @@ against `ingest/` — no content edits were needed when the service moved into
 
 - **builder:** creates `/opt/venv`, `pip install .` from `pyproject.toml` + `src`.
   Asserts `schema.sql` got packaged (`db.py` reads it at runtime) — the build
-  fails loudly otherwise.
+  fails loudly otherwise. Runtime deps are pinned in `pyproject.toml`; note
+  `orjson` (fast WS frame decode) is a compiled wheel — it ships prebuilt for the
+  image's `linux/amd64` CPython, so no build toolchain is needed.
 - **runtime:** slim image, installs `gosu` + `ca-certificates`, creates non-root
   `appuser` (uid 10001), copies the venv. `ENTRYPOINT` is `entrypoint.sh`; `CMD`
   is `python -m simplex_ingest`. `EXPOSE 8080`. `SIMPLEX_DATA_DIR=/data`.
@@ -237,7 +239,19 @@ Watch the logs and confirm, in order — this is the end-to-end cutover signatur
 1. `discovery cycle complete` — `series_seen=… admitted=… tracked=N` (eager, early).
 2. `catalog refreshed` — `series=N active_markets=M` (next catalog tick).
 3. `ws reconciled` — `added=M removed=0` (first convergence) / `ws initial subscribe`.
-4. `snapshots emitted` — `markets=M` within one `SNAPSHOT_INTERVAL`.
+4. `snapshots emitted` — `markets=M` within one `SNAPSHOT_INTERVAL`; the grid
+   timestamps should be a **clean `SNAPSHOT_INTERVAL_SECONDS` (10 s) apart** (the
+   applier/sampler split decouples grid cadence from drain load). Every
+   `METRICS_LOG_INTERVAL_SECONDS` the hot-path loops also roll up `snapshot
+   metrics` (`events_per_s`, `mean_sample_ms`, `books`, `active`) and `ws metrics`
+   (`frames_per_s`, `reconnects`, `reconciles`, `resets`) — watch `reconnects`
+   stay ~flat (no keepalive-timeout flapping) and `mean_sample_ms` stay well under
+   the 10 s budget. The catalog also logs `catalog volume distribution`
+   (percentiles + counts below candidate floors) — **use this to set
+   `CATALOG_MIN_MARKET_VOLUME`**: read the percentiles off a live deploy, then
+   raise the floor (and/or lower `MAX_ACTIVE_MARKETS`) to drop the near-zero-
+   liquidity tail. A `dropping out-of-range level` line names any market resting
+   at a non-tradeable price (its level is excluded; the book stays valid).
 5. **If `OPENROUTER_API_KEY` is set:** `semantics extracted` (per market), then
    `edge classified` (per pair), then `extraction cycle complete`
    — `reconciled=… semantics=… edges=…` (within one `EXTRACTION_INTERVAL`, after
