@@ -121,13 +121,23 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 - Replaces the old hand-curated `simplex_allowlist.yaml` + weighted-score
   discovery script (both deleted). Dry-run inspector:
   `python -m simplex_ingest.loops.discovery`.
-- **Also owns time-series retention.** At the end of every cycle it prunes the
-  regenerable/append tables (`raw_events`, `snapshots`, `audit_results`,
-  `book_state`) to the last `DATA_RETENTION_CYCLES` cycles (`prune()` →
-  `db.prune_time_series`). Anchoring retention to the discovery cycle keeps the
-  rolling window in sync with the hourly market-set recompute by construction;
-  it prunes regardless of whether the sweep admitted anything (a failed/empty
-  sweep must not let the volume grow). The durable LLM graph is never pruned.
+- **Also owns retention.** At the end of every cycle `prune()` does three things,
+  each independently guarded:
+  1. **Time-series rolling window** — prunes `raw_events`/`snapshots`/
+     `audit_results`/`book_state` to the last `DATA_RETENTION_CYCLES` cycles
+     (`db.prune_time_series`). It prunes regardless of whether the sweep admitted
+     anything (a failed/empty sweep must not let the volume grow).
+  2. **Resolution reconciliation** — for graph markets that have left the active
+     set with no known resolution time, it looks them up via Kalshi REST
+     (`reconcile_resolutions` → `rest.get_market`) and persists
+     `markets.resolved_at` from the authoritative `settlement_ts` (falling back
+     to `close_time`). This is needed because a settled market's event is no
+     longer *open*, so it never reappears in the catalog's open-events sweep.
+  3. **Resolved-graph prune** — deletes `market_semantics`/`market_edges` for
+     markets resolved more than `GRAPH_PRUNE_AFTER_RESOLVED_SECONDS` (1 h) ago
+     (`db.prune_resolved_graph`; an edge goes if *either* endpoint resolved).
+  Anchoring all of this to the discovery cycle keeps retention in sync with the
+  hourly market-set recompute by construction.
 
 ### Catalog poller (`loops/catalog.py`)
 - **Cadence:** every `CATALOG_REFRESH_SECONDS` (5 min).
@@ -305,10 +315,17 @@ remain regenerable from it there — but the window is finite, so long-term hist
 is intentionally not retained (the planned R2 export, §11, is where a durable
 historical corpus would live). The Stage-3 tables are the **other** class: they
 are LLM-derived (costly, non-deterministic, and — review decisions — partly
-human-curated), cannot be reconstructed from `raw_events`, and are therefore
-**exempt from pruning** — append/upsert only, never wiped, included in
-backup/export. "Cached forever" in `market_semantics` is a durability
-requirement, not just an optimization.
+human-curated) and cannot be reconstructed from `raw_events`, so they are
+**exempt from the time-series window** — they live by a different rule keyed on
+the *market's lifecycle*, not a fixed clock: a market's semantics/edges are kept
+for as long as the market is live and are deleted only
+`GRAPH_PRUNE_AFTER_RESOLVED_SECONDS` (1 h) after the market **resolves** (becomes
+terminal on Kalshi). A resolved market never reopens, so its graph is dead weight
+for the live engine and deleting it carries no re-spend risk (unlike a market
+merely dropped from the tracked set, which may be re-admitted — those are kept).
+The durability requirement therefore applies to the graph of *live* markets;
+long-term history of resolved markets belongs in the R2 export (§11), not the
+operational DB.
 
 **Timestamps:** DuckDB `TIMESTAMP` is naive; all writes normalize to naive UTC
 (`util.naive_utc`). Aware UTC is used in memory.
@@ -429,11 +446,16 @@ venue-neutral (`platform` tag on every row).
 5. **Malformed external input must not raise into a loop** — log and drop/skip.
    The WS subscribers drop a bad message; the extraction LLM client raises a
    typed `LLMError` and the loop logs-and-skips that one market/pair.
-6. **The Stage-3 extraction outputs are durable and non-regenerable.**
-   `market_semantics` and `market_edges` are LLM-derived (and partly
-   human-curated) — unlike `snapshots`/`book_state` they cannot be rebuilt from
-   `raw_events`, so they are never wiped on a transient error and must be covered
-   by backup/export (§5, §11).
+6. **The Stage-3 extraction outputs are non-regenerable; durable while the market
+   is live, pruned after it resolves.** `market_semantics` and `market_edges` are
+   LLM-derived (and partly human-curated) — unlike `snapshots`/`book_state` they
+   cannot be rebuilt from `raw_events`, so they are never wiped on a transient
+   error or re-run. The one deliberate deletion is lifecycle-driven: once a market
+   **resolves** (terminal on Kalshi — outcome known, `markets.resolved_at` set
+   from `settlement_ts`), its graph is dead weight and is pruned
+   `GRAPH_PRUNE_AFTER_RESOLVED_SECONDS` (1 h) later by the discovery loop. Live
+   markets' graph must still be covered by backup/export (§5, §11); resolved
+   markets' history belongs only in the export.
 
 ---
 

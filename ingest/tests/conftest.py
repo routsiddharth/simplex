@@ -112,13 +112,16 @@ def make_series_stats():
 class FakeREST:
     """Minimal stand-in for KalshiREST over in-memory events + orderbooks."""
 
-    def __init__(self, events=None, raise_exc=None, orderbooks=None):
+    def __init__(self, events=None, raise_exc=None, orderbooks=None, markets=None):
         self.events = list(events or [])
         self.raise_exc = raise_exc
         # ticker -> raw orderbook_fp dict ({"yes": [[p, s], ...], "no": [...]})
         self.orderbooks = dict(orderbooks or {})
+        # ticker -> Kalshi market dict (for get_market / resolution reconciliation)
+        self.markets = dict(markets or {})
         self.calls = 0
         self.orderbook_calls = 0
+        self.market_calls = 0
 
     async def get_events(self, status="open", series_ticker=None,
                          with_nested_markets=False, limit=200):
@@ -133,11 +136,15 @@ class FakeREST:
         self.orderbook_calls += 1
         return self.orderbooks.get(ticker, {"yes": [], "no": []})
 
+    async def get_market(self, ticker):
+        self.market_calls += 1
+        return self.markets.get(ticker)
+
 
 @pytest.fixture
 def make_fake_rest():
-    def _make(events=None, raise_exc=None, orderbooks=None):
-        return FakeREST(events=events, raise_exc=raise_exc, orderbooks=orderbooks)
+    def _make(events=None, raise_exc=None, orderbooks=None, markets=None):
+        return FakeREST(events=events, raise_exc=raise_exc, orderbooks=orderbooks, markets=markets)
 
     return _make
 

@@ -42,8 +42,9 @@ The repo is a **monorepo**: the ingest service is self-contained under
 `ingest/`.
 
 The six loops: **discovery** (hourly — self-manages the `tracked_series` set via
-predicates, and prunes the time-series tables to the retention window each
-cycle), **catalog** (5 min — tracked series → active market set),
+predicates; prunes the time-series tables to the retention window; and reconciles
+market resolution against Kalshi to drop the graph of resolved markets), **catalog**
+(5 min — tracked series → active market set),
 **websocket** (persistent — orderbook/trade/lifecycle → `raw_events`),
 **snapshot** (10 s — replays `raw_events` → `snapshots` grid + book checkpoints),
 **audit** (hourly — in-memory book vs REST reconciliation), **extraction** (5 min
@@ -76,8 +77,12 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
    (≈3 h) by the discovery loop each cycle, in sync with the hourly market-set
    recompute. `snapshots`/`book_state`/`audit_results` are pruned on the same
    cadence; `snapshots`/`book_state` are regenerable from `raw_events` only
-   *within* that window. The durable LLM graph (`market_semantics`/
-   `market_edges`) is **never** pruned — it is the one keep-forever store.
+   *within* that window. The LLM graph (`market_semantics`/`market_edges`) is
+   kept while a market is live, but pruned `GRAPH_PRUNE_AFTER_RESOLVED_SECONDS`
+   (1 h) after the market **resolves** — a resolved market is terminal, so its
+   graph is dead weight and deleting it is safe (it never reopens, so no
+   re-spend). Resolution time is `markets.resolved_at`, sourced from Kalshi
+   `settlement_ts` and reconciled by the discovery loop.
 2. **DuckDB is single-writer, single-process.** One process holds the lock; this
    is why ingest is one process and the deploy is **a single instance — never
    scale out**. A second writer (e.g. a future trader) forces a storage split

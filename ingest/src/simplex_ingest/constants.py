@@ -240,6 +240,22 @@ completed *and* DATA_RETENTION_CYCLES further cycles have elapsed. With the
 defaults (2 cycles, 1 h interval) the oldest retained data is ≈ 3 h; pruning each
 cycle deletes everything with a timestamp older than ``now - this``."""
 
+GRAPH_PRUNE_AFTER_RESOLVED_SECONDS = 3600
+"""How long after a market *resolves* its LLM graph (`market_semantics` +
+`market_edges`) is deleted. A resolved market is terminal — it never reopens, so
+its semantics/edges are dead weight for the live coherence engine, and (unlike a
+market temporarily dropped from the tracked set) there is no re-admission and so
+no re-spend risk in deleting them. Resolution time is `markets.resolved_at`,
+sourced authoritatively from Kalshi `settlement_ts` (see the discovery loop's
+resolution reconciliation). 1 h = the data lingers one discovery cycle past
+resolution, then goes."""
+
+GRAPH_RESOLUTION_CHECK_BATCH = 200
+"""Max markets to reconcile against Kalshi REST per discovery cycle. The
+candidates are graph markets that left the active set with no known resolution
+time; each costs one `GET /markets/{ticker}`, so this caps the REST spend while a
+backlog drains across cycles."""
+
 
 # --------------------------------------------------------------------------
 # LLM extraction layer (Stage 3) — semantics + relationship edges

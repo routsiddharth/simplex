@@ -19,14 +19,31 @@ working set on a blip.
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from .. import constants as C
 from ..discovery_predicates import aggregate, evaluate, rank_key
 from ..log import get_logger
-from ..util import idle_sleep, naive_utc, now_utc
+from ..util import idle_sleep, naive_utc, now_utc, parse_dt
 
 log = get_logger("discovery")
+
+# Kalshi market statuses past the live-trading phase (outcome known / settling /
+# settled). A non-empty `result` is the other resolution signal. See the Kalshi
+# market lifecycle: active -> closed -> determined -> finalized.
+_TERMINAL_STATUSES = {"determined", "disputed", "amended", "finalized", "settled"}
+
+
+def _resolution_time(market: dict) -> datetime | None:
+    """Authoritative resolution time from a Kalshi market dict, or None if it is
+    not resolved yet. Resolved = a non-empty ``result`` or a terminal ``status``;
+    the timestamp is ``settlement_ts`` (set at finalized), falling back to
+    ``close_time`` when determined-but-not-yet-finalized, then to now."""
+    result = (market.get("result") or "").strip()
+    status = (market.get("status") or "").strip().lower()
+    if not result and status not in _TERMINAL_STATUSES:
+        return None
+    return parse_dt(market.get("settlement_ts")) or parse_dt(market.get("close_time")) or now_utc()
 
 
 class DiscoveryLoop:
@@ -105,20 +122,66 @@ class DiscoveryLoop:
         )
 
     async def prune(self) -> None:
-        """Enforce the rolling-window retention (see C.DATA_RETENTION_*).
+        """Enforce retention each cycle (in sync with the hourly recompute):
 
-        Deletes time-series rows older than ``DATA_RETENTION_SECONDS`` so the
-        volume stays bounded to the last few discovery cycles instead of growing
-        without limit. Runs every cycle, so it is in sync with the hourly
-        market-set recompute. The durable LLM graph is not touched."""
-        cutoff = naive_utc(now_utc()) - timedelta(seconds=C.DATA_RETENTION_SECONDS)
+        1. trim the time-series tables to the rolling window (DATA_RETENTION_*),
+        2. reconcile resolution for graph markets against Kalshi (source of truth),
+        3. delete the LLM graph for markets resolved > GRAPH_PRUNE_AFTER_RESOLVED_*.
+
+        Each step is independently guarded so one failure can't skip the others."""
+        # (1) time-series rolling window
+        ts_cutoff = naive_utc(now_utc()) - timedelta(seconds=C.DATA_RETENTION_SECONDS)
         try:
-            deleted = await asyncio.to_thread(self.rt.db.prune_time_series, cutoff)
+            deleted = await asyncio.to_thread(self.rt.db.prune_time_series, ts_cutoff)
+            if any(deleted.values()):
+                log.info("retention prune complete", extra={"cutoff": ts_cutoff.isoformat(), **deleted})
         except Exception:
             log.exception("retention prune failed")
+
+        # (2) learn resolution times from Kalshi
+        try:
+            await self.reconcile_resolutions()
+        except Exception:
+            log.exception("resolution reconciliation failed")
+
+        # (3) drop the graph for markets resolved long enough ago
+        g_cutoff = naive_utc(now_utc()) - timedelta(seconds=C.GRAPH_PRUNE_AFTER_RESOLVED_SECONDS)
+        try:
+            g = await asyncio.to_thread(self.rt.db.prune_resolved_graph, g_cutoff)
+            if any(g.values()):
+                log.info("resolved-graph prune complete", extra={"cutoff": g_cutoff.isoformat(), **g})
+        except Exception:
+            log.exception("resolved-graph prune failed")
+
+    async def reconcile_resolutions(self) -> None:
+        """Persist `resolved_at` for graph markets that left the active set, using
+        Kalshi REST as the source of truth.
+
+        A settled market's event is no longer open, so it won't appear in the
+        catalog's open-events sweep — we look it up directly. Only markets in the
+        graph with no known resolution time are checked (bounded by
+        GRAPH_RESOLUTION_CHECK_BATCH); the result anchors the resolved-graph
+        prune above."""
+        pending = await asyncio.to_thread(
+            self.rt.db.graph_markets_pending_resolution, C.GRAPH_RESOLUTION_CHECK_BATCH
+        )
+        if not pending:
             return
-        if any(deleted.values()):
-            log.info("retention prune complete", extra={"cutoff": cutoff.isoformat(), **deleted})
+        resolved: list[tuple[str, datetime]] = []
+        for ticker in pending:
+            try:
+                market = await self.rt.rest.get_market(ticker)
+            except Exception:
+                log.warning("resolution check failed", extra={"market": ticker})
+                continue
+            if not market:
+                continue
+            ts = _resolution_time(market)
+            if ts is not None:
+                resolved.append((ticker, ts))
+        if resolved:
+            await asyncio.to_thread(self.rt.db.mark_resolved, resolved)
+            log.info("resolution reconciled", extra={"checked": len(pending), "resolved": len(resolved)})
 
 
 def discover_once() -> None:

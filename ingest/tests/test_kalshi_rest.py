@@ -116,3 +116,18 @@ async def test_get_series_returns_none_on_404(make_signer):
         assert await rest.get_series("NOPE") is None
     finally:
         await rest.aclose()
+
+
+async def test_get_market_unwraps_market_and_handles_404(make_signer):
+    def handler(req):
+        if req.url.path.endswith("/markets/KXM"):
+            return httpx.Response(200, json={"market": {"ticker": "KXM", "status": "finalized", "result": "yes"}})
+        return httpx.Response(404, json={"error": "missing"})
+
+    rest = _rest(make_signer, handler)
+    try:
+        m = await rest.get_market("KXM")
+        assert m["status"] == "finalized" and m["result"] == "yes"
+        assert await rest.get_market("NOPE") is None
+    finally:
+        await rest.aclose()

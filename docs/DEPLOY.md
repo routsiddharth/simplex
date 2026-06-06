@@ -137,13 +137,14 @@ Railway auto-injects `RAILWAY_VOLUME_MOUNT_PATH=/data`; we ignore it and read
 The DB file is `/data/simplex.duckdb`. The volume is durable across
 restarts/redeploys but is **not a backup** (see §11).
 
-**Sizing.** The time-series tables are pruned to a rolling window (the discovery
-loop enforces `DATA_RETENTION_CYCLES`, ≈3 h of `raw_events`/`snapshots`/
-`audit_results`/`book_state` — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.1), so
-the bulk of the DB no longer grows without bound; 10 GB is ample headroom. The
-only monotonically-growing store is the durable LLM graph
-(`market_semantics`/`market_edges`), which is small per row and is exactly why the
-volume must be a *real* persistent mount.
+**Sizing.** Both data classes are bounded by the discovery loop (see
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) §3, §9): the time-series tables
+(`raw_events`/`snapshots`/`audit_results`/`book_state`) to a ≈3 h rolling window
+(`DATA_RETENTION_CYCLES`), and the LLM graph (`market_semantics`/`market_edges`)
+to live markets plus 1 h past resolution (`GRAPH_PRUNE_AFTER_RESOLVED_SECONDS`).
+So the DB tracks roughly the current tracked set rather than growing without
+bound; 10 GB is ample headroom. The volume still must be a *real* persistent
+mount — the graph of live markets is non-regenerable and costly to rebuild.
 
 ---
 

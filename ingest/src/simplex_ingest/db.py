@@ -538,6 +538,79 @@ class Database:
                 deleted[table] = before - after
         return deleted
 
+    # -- resolution (graph retention) --------------------------------------
+
+    def graph_markets_pending_resolution(self, limit: int) -> list[str]:
+        """Markets that are in the LLM graph, no longer subscribed, and whose
+        resolution time is not yet known — the set to reconcile against Kalshi.
+
+        A still-subscribed market is live (not resolved); one we already have a
+        ``resolved_at`` for needs no re-check. Capped at ``limit`` so a backlog
+        bounds the REST calls per cycle."""
+        with self._lock:
+            rows = self._con.execute(
+                """
+                SELECT m.market_id
+                FROM markets m
+                WHERE m.subscribed = FALSE
+                  AND m.resolved_at IS NULL
+                  AND (m.market_id IN (SELECT market_id FROM market_semantics)
+                       OR m.market_id IN (SELECT market_id_a FROM market_edges)
+                       OR m.market_id IN (SELECT market_id_b FROM market_edges))
+                LIMIT ?
+                """,
+                [limit],
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def mark_resolved(self, rows: list[tuple[str, datetime]]) -> int:
+        """Persist ``resolved_at`` for the given (market_id, ts) pairs, but never
+        overwrite an existing value (first known resolution time wins)."""
+        if not rows:
+            return 0
+        norm = [(naive_utc(ts), mid) for (mid, ts) in rows]
+        with self._lock:
+            self._con.executemany(
+                "UPDATE markets SET resolved_at = ? WHERE market_id = ? AND resolved_at IS NULL",
+                norm,
+            )
+            n = self._con.execute(
+                "SELECT count(*) FROM markets WHERE resolved_at IS NOT NULL"
+            ).fetchone()[0]
+        return n
+
+    def prune_resolved_graph(self, cutoff: datetime) -> dict[str, int]:
+        """Delete the LLM graph (semantics + edges) for markets that resolved
+        before ``cutoff``. An edge goes if *either* endpoint has resolved — a
+        resolved leg can't be a live coherence constraint. Returns deleted counts.
+
+        This is the one exception to the graph's keep-forever durability: a
+        resolved market is terminal (it never reopens), so its semantics/edges
+        are dead weight for the live engine — see ARCHITECTURE §5/§9."""
+        co = naive_utc(cutoff)
+        with self._lock:
+            resolved = [
+                r[0] for r in self._con.execute(
+                    "SELECT market_id FROM markets WHERE resolved_at IS NOT NULL AND resolved_at < ?",
+                    [co],
+                ).fetchall()
+            ]
+            if not resolved:
+                return {"market_semantics": 0, "market_edges": 0}
+            ph = ", ".join("?" * len(resolved))
+            sem_before = self._con.execute("SELECT count(*) FROM market_semantics").fetchone()[0]
+            edge_before = self._con.execute("SELECT count(*) FROM market_edges").fetchone()[0]
+            self._con.execute(
+                f"DELETE FROM market_semantics WHERE market_id IN ({ph})", resolved
+            )
+            self._con.execute(
+                f"DELETE FROM market_edges WHERE market_id_a IN ({ph}) OR market_id_b IN ({ph})",
+                resolved + resolved,
+            )
+            sem_after = self._con.execute("SELECT count(*) FROM market_semantics").fetchone()[0]
+            edge_after = self._con.execute("SELECT count(*) FROM market_edges").fetchone()[0]
+        return {"market_semantics": sem_before - sem_after, "market_edges": edge_before - edge_after}
+
     # -- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:

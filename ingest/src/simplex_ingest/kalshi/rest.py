@@ -148,3 +148,17 @@ class KalshiREST:
         """Returns the raw orderbook_fp dict ({yes_dollars, no_dollars})."""
         data = await self._get(f"/markets/{ticker}/orderbook", {"depth": depth})
         return data.get("orderbook_fp") or data.get("orderbook") or {}
+
+    async def get_market(self, ticker: str) -> dict[str, Any] | None:
+        """One market by ticker — the authoritative status/result/settlement_ts.
+
+        Used to reconcile resolution for markets that have left the open-events
+        sweep (a settled market's event is no longer open, so it won't appear in
+        `get_events`). Returns None on 404."""
+        try:
+            data = await self._get(f"/markets/{ticker}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return data.get("market")
