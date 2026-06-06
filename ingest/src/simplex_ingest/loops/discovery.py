@@ -19,6 +19,7 @@ working set on a blip.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 from .. import constants as C
 from ..discovery_predicates import aggregate, evaluate, rank_key
@@ -40,6 +41,7 @@ class DiscoveryLoop:
             await self.discover()
         except Exception:
             log.exception("initial discovery failed")
+        await self.prune()
         self.rt.heartbeats.beat(self.name)
 
         while not self.rt.shutdown.is_set():
@@ -50,6 +52,10 @@ class DiscoveryLoop:
                 await self.discover()
             except Exception:
                 log.exception("discovery cycle failed")
+            # Retention is anchored to the discovery cycle (the hourly market-set
+            # recompute), so prune here regardless of whether the sweep admitted
+            # anything — a failed/empty sweep must not let the volume grow.
+            await self.prune()
             self.rt.heartbeats.beat(self.name)
 
     async def discover(self) -> None:
@@ -97,6 +103,22 @@ class DiscoveryLoop:
             "discovery cycle complete",
             extra={"series_seen": len(stats), "admitted": len(admitted), "tracked": len(top)},
         )
+
+    async def prune(self) -> None:
+        """Enforce the rolling-window retention (see C.DATA_RETENTION_*).
+
+        Deletes time-series rows older than ``DATA_RETENTION_SECONDS`` so the
+        volume stays bounded to the last few discovery cycles instead of growing
+        without limit. Runs every cycle, so it is in sync with the hourly
+        market-set recompute. The durable LLM graph is not touched."""
+        cutoff = naive_utc(now_utc()) - timedelta(seconds=C.DATA_RETENTION_SECONDS)
+        try:
+            deleted = await asyncio.to_thread(self.rt.db.prune_time_series, cutoff)
+        except Exception:
+            log.exception("retention prune failed")
+            return
+        if any(deleted.values()):
+            log.info("retention prune complete", extra={"cutoff": cutoff.isoformat(), **deleted})
 
 
 def discover_once() -> None:

@@ -223,6 +223,23 @@ empty. Discovery populates it eagerly within seconds of start, so an empty table
 past this grace means discovery is failing (REST down, bad creds) and the WS set
 will stay idle. Informational — the process stays up either way."""
 
+DATA_RETENTION_CYCLES = 2
+"""How many *completed* discovery cycles of time-series data to retain beyond the
+one a row belongs to. Discovery owns the hourly market set; a row written while a
+given set was active is kept until DATA_RETENTION_CYCLES whole cycles have
+completed after that set's hour ends, then pruned. The prune runs at the end of
+every discovery cycle, so retention is inherently in sync with the hourly
+recompute. Applies ONLY to the regenerable/append time-series tables
+(`raw_events`, `snapshots`, `audit_results`, `book_state`) — NOT to the durable
+LLM-derived `market_semantics`/`market_edges` graph (see ARCHITECTURE §5/§9)."""
+
+DATA_RETENTION_SECONDS = (DATA_RETENTION_CYCLES + 1) * DISCOVERY_INTERVAL_SECONDS
+"""Concrete cutoff age derived from the cycle count. The ``+1`` covers the row's
+own (up to one-cycle-long) active hour, so a row is pruned once its hour has
+completed *and* DATA_RETENTION_CYCLES further cycles have elapsed. With the
+defaults (2 cycles, 1 h interval) the oldest retained data is ≈ 3 h; pruning each
+cycle deletes everything with a timestamp older than ``now - this``."""
+
 
 # --------------------------------------------------------------------------
 # LLM extraction layer (Stage 3) — semantics + relationship edges

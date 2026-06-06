@@ -42,7 +42,8 @@ The repo is a **monorepo**: the ingest service is self-contained under
 `ingest/`.
 
 The six loops: **discovery** (hourly — self-manages the `tracked_series` set via
-predicates), **catalog** (5 min — tracked series → active market set),
+predicates, and prunes the time-series tables to the retention window each
+cycle), **catalog** (5 min — tracked series → active market set),
 **websocket** (persistent — orderbook/trade/lifecycle → `raw_events`),
 **snapshot** (10 s — replays `raw_events` → `snapshots` grid + book checkpoints),
 **audit** (hourly — in-memory book vs REST reconciliation), **extraction** (5 min
@@ -57,7 +58,11 @@ python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env                       # 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
 python -m simplex_ingest                   # run the ingest; GET :8080/health
-pytest                                     # 146 tests (predicates, candidates, DB, loops, extraction, orderbook, reconstruct)
+pytest                                     # 188 hermetic tests (units: predicates, candidates,
+                                           #   orderbook, reconstruct, fixedpoint, auth/REST/LLM
+                                           #   clients, supervisor, health, DB; loops + full
+                                           #   end-to-end pipeline over a local WS server)
+pytest --run-live                          # + 4 opt-in live smoke tests vs the Railway deploy
 python -m simplex_ingest.loops.discovery   # dry-run: print admitted/rejected series
 python -m simplex_ingest.loops.extraction  # dry-run: extraction work plan (ingest stopped)
 ```
@@ -66,8 +71,13 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
 
 ## Constraints & invariants (don't break silently)
 
-1. **`raw_events` is the source of truth** — append-only, never deleted.
-   `snapshots` and `book_state` are regenerable from it.
+1. **`raw_events` is the source of truth *within the retention window*** —
+   append-only, but pruned to the last `DATA_RETENTION_CYCLES` discovery cycles
+   (≈3 h) by the discovery loop each cycle, in sync with the hourly market-set
+   recompute. `snapshots`/`book_state`/`audit_results` are pruned on the same
+   cadence; `snapshots`/`book_state` are regenerable from `raw_events` only
+   *within* that window. The durable LLM graph (`market_semantics`/
+   `market_edges`) is **never** pruned — it is the one keep-forever store.
 2. **DuckDB is single-writer, single-process.** One process holds the lock; this
    is why ingest is one process and the deploy is **a single instance — never
    scale out**. A second writer (e.g. a future trader) forces a storage split
@@ -95,8 +105,15 @@ Deploy is Railway, single always-on instance — see [`docs/DEPLOY.md`](./docs/D
   complete`).
 - **Tests** live in `tests/` (pytest + hypothesis, `asyncio_mode=auto`). Pure
   logic (predicates) gets exhaustive + property coverage; DB ops get atomicity
-  tests; loops get behavior tests over `fake_rest` + a tmp DuckDB. Add tests with
-  the code, run `pytest` green before committing.
+  tests; loops get behavior tests over `fake_rest` + a tmp DuckDB; HTTP clients
+  (Kalshi REST, OpenRouter) get `httpx.MockTransport` tests. `test_end_to_end.py`
+  wires the **real** loops (discovery → catalog → websocket → snapshot →
+  extraction) over a local Kalshi-shaped WS server + tmp DuckDB and asserts data
+  flows through every stage. Live smoke tests (`tests/test_live_railway.py`,
+  marked `live`) are **opt-in** via `--run-live`: they hit the deploy's `/health`
+  and, when the `railway` CLI is linked, scrape per-loop log activity and confirm
+  the DuckDB file on the volume — so the default `pytest` stays hermetic/offline.
+  Add tests with the code, run `pytest` green before committing.
 - **Kalshi specifics** (RSA-PSS auth, bids-only book where `yes_ask = 1 −
   best_no_bid`, WS `seq` semantics, fixed-point dollars) were confirmed against
   live docs — see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §6–7.

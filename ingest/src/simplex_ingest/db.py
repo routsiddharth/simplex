@@ -503,6 +503,41 @@ class Database:
             ).fetchall()
         return {r[0]: float(r[1]) for r in rows if r[1] is not None}
 
+    # -- retention ----------------------------------------------------------
+
+    # The regenerable/append-only time-series tables and the timestamp column
+    # each is pruned on. The durable LLM-derived graph (market_semantics,
+    # market_edges) and the self-managed catalog (markets, tracked_series) are
+    # deliberately absent — they are not time-series and are not pruned here.
+    _RETENTION_TABLES = (
+        ("raw_events", "received_ts"),
+        ("snapshots", "ts"),
+        ("audit_results", "ts"),
+        ("book_state", "last_ts"),
+    )
+
+    def prune_time_series(self, cutoff: datetime) -> dict[str, int]:
+        """Delete time-series rows older than ``cutoff`` (naive UTC). Returns the
+        per-table deleted-row counts.
+
+        This is the retention seam: it bounds the volume to a rolling window
+        instead of letting the append-only log grow without limit. ``raw_events``
+        stops being a permanent source of truth — it is the source of truth only
+        within the retention window (see ARCHITECTURE §9). Flushes the raw_events
+        buffer first so freshly-received-but-unwritten events can't be missed and
+        then immediately resurrected past the cutoff."""
+        self.flush_raw_events()
+        co = naive_utc(cutoff)
+        deleted: dict[str, int] = {}
+        with self._lock:
+            for table, ts_col in self._RETENTION_TABLES:
+                before = self._con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                # last_ts can be NULL (a checkpoint never anchored); keep those.
+                self._con.execute(f"DELETE FROM {table} WHERE {ts_col} < ?", [co])
+                after = self._con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                deleted[table] = before - after
+        return deleted
+
     # -- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:

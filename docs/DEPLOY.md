@@ -115,6 +115,16 @@ Create a **10 GB volume mounted at `/data`** and attach it to the service.
 **Do not** add a Railway Postgres/managed DB for Stage 1 — DuckDB on the volume
 is the store.
 
+> ⚠️ **The volume is mandatory and easy to forget.** Without it, `SIMPLEX_DATA_DIR=/data`
+> resolves to the **ephemeral container overlay**: the DB still writes and the app
+> looks healthy, but **every redeploy/restart silently wipes everything** —
+> including the durable, costly-to-rebuild `market_semantics`/`market_edges` graph.
+> Verify with `railway ssh -s <svc> "grep ' /data ' /proc/mounts"` (a line means a
+> real volume is mounted; no line means overlay). The opt-in live test
+> `test_live_railway.py::test_live_duckdb_is_persisted_on_a_real_volume`
+> (`pytest --run-live`) asserts exactly this and fails loudly when the volume is
+> missing.
+
 ```bash
 railway volume add --mount-path /data    # then set/grow size to 10 GB in the UI
 ```
@@ -126,6 +136,14 @@ Railway auto-injects `RAILWAY_VOLUME_MOUNT_PATH=/data`; we ignore it and read
 
 The DB file is `/data/simplex.duckdb`. The volume is durable across
 restarts/redeploys but is **not a backup** (see §11).
+
+**Sizing.** The time-series tables are pruned to a rolling window (the discovery
+loop enforces `DATA_RETENTION_CYCLES`, ≈3 h of `raw_events`/`snapshots`/
+`audit_results`/`book_state` — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.1), so
+the bulk of the DB no longer grows without bound; 10 GB is ample headroom. The
+only monotonically-growing store is the durable LLM graph
+(`market_semantics`/`market_edges`), which is small per row and is exactly why the
+volume must be a *real* persistent mount.
 
 ---
 

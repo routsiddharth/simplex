@@ -121,6 +121,13 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 - Replaces the old hand-curated `simplex_allowlist.yaml` + weighted-score
   discovery script (both deleted). Dry-run inspector:
   `python -m simplex_ingest.loops.discovery`.
+- **Also owns time-series retention.** At the end of every cycle it prunes the
+  regenerable/append tables (`raw_events`, `snapshots`, `audit_results`,
+  `book_state`) to the last `DATA_RETENTION_CYCLES` cycles (`prune()` →
+  `db.prune_time_series`). Anchoring retention to the discovery cycle keeps the
+  rolling window in sync with the hourly market-set recompute by construction;
+  it prunes regardless of whether the sweep admitted anything (a failed/empty
+  sweep must not let the volume grow). The durable LLM graph is never pruned.
 
 ### Catalog poller (`loops/catalog.py`)
 - **Cadence:** every `CATALOG_REFRESH_SECONDS` (5 min).
@@ -283,20 +290,25 @@ lock; `raw_events` writes are buffered and flushed in batches.
 |-------|------|------|
 | `tracked_series` | Self-managed set of series to ingest. | Rewritten atomically each discovery cycle (admit/rank/cap). Replaces the YAML allowlist. PK `series_ticker`; `admitted_at` preserved across re-admits. |
 | `markets` | Catalog; `subscribed` flags the active WS set. | Rows never deleted — closed markets keep history, only `subscribed` flips. |
-| `raw_events` | **Append-only normalized event log — the source of truth.** | `received_ts` (our monotonic ingest clock) + DuckDB `rowid` order replay; `sequence` is the exchange per-subscription seq for gap detection. Never deleted. |
-| `snapshots` | 10 s materialized grid — the marginal time series the solver reads. | Regenerable from `raw_events`. PK `(ts, platform, market_id)` gives idempotency under window re-runs. |
+| `raw_events` | **Append-only normalized event log — the source of truth (within the retention window).** | `received_ts` (our monotonic ingest clock) + DuckDB `rowid` order replay; `sequence` is the exchange per-subscription seq for gap detection. **Pruned** to the last `DATA_RETENTION_CYCLES` discovery cycles (not kept forever). |
+| `snapshots` | 10 s materialized grid — the marginal time series the solver reads. | Regenerable from `raw_events` **within the retention window**; pruned on the same cadence. PK `(ts, platform, market_id)` gives idempotency under window re-runs. |
 | `book_state` | Serialized in-memory books for fast restart. | A replay accelerator, not a source of truth. |
 | `audit_results` | Per-market book-vs-REST reconciliation outcomes. | `no_diff`/`small_diff`/`large_diff`/`error`; `action_taken` none/`book_reset`. |
 | `market_semantics` | **Stage-3 per-market semantic cache (LLM-derived).** | PK `market_id`. Cached forever; re-extracted only when `extraction_version` bumps. `entities`/`dependencies` are JSON arrays. **Non-regenerable** (see below). |
 | `market_edges` | **Stage-3 pairwise typed relationship graph (LLM-derived).** | PK `(platform, market_id_a, market_id_b)`, canonical `a < b`. `trust_tier` ∈ `trusted`/`soft`/`review`; `agreement_status`; review-queue columns. The review queue is the query `trust_tier='review' AND review_status='pending'` — no separate table. **Non-regenerable** (see below). |
 
-**Two source-of-truth classes.** `snapshots` and `book_state` are *derived* —
-fully regenerable from `raw_events`, safe to drop and rebuild. The Stage-3
-tables are **not**: they are LLM-derived (costly, non-deterministic, and —
-review decisions — partly human-curated), so they cannot be reconstructed from
-`raw_events`. They get **`raw_events`-grade durability**: append/upsert only,
-never casually wiped, and included in backup/export (§9, §11). "Cached forever"
-in `market_semantics` is a durability requirement, not just an optimization.
+**Two retention classes.** The time-series tables (`raw_events`, `snapshots`,
+`book_state`, `audit_results`) are a **rolling window**: the discovery loop prunes
+them to the last `DATA_RETENTION_CYCLES` cycles each cycle (§3, §9.1). `raw_events`
+is still the source of truth *within* that window, and `snapshots`/`book_state`
+remain regenerable from it there — but the window is finite, so long-term history
+is intentionally not retained (the planned R2 export, §11, is where a durable
+historical corpus would live). The Stage-3 tables are the **other** class: they
+are LLM-derived (costly, non-deterministic, and — review decisions — partly
+human-curated), cannot be reconstructed from `raw_events`, and are therefore
+**exempt from pruning** — append/upsert only, never wiped, included in
+backup/export. "Cached forever" in `market_semantics` is a durability
+requirement, not just an optimization.
 
 **Timestamps:** DuckDB `TIMESTAMP` is naive; all writes normalize to naive UTC
 (`util.naive_utc`). Aware UTC is used in memory.
@@ -392,8 +404,15 @@ venue-neutral (`platform` tag on every row).
 
 ## 9. Key invariants (do not break without updating this file)
 
-1. **`raw_events` is the source of truth.** It is append-only and never deleted;
-   `snapshots` and `book_state` are regenerable from it.
+1. **`raw_events` is the source of truth — within a bounded retention window.**
+   It is append-only, but **not** kept forever: the discovery loop prunes it (and
+   `snapshots`/`book_state`/`audit_results`) to the last `DATA_RETENTION_CYCLES`
+   discovery cycles each cycle (`DATA_RETENTION_SECONDS` ≈ 3 h with the defaults),
+   so the volume stays bounded instead of growing without limit. `snapshots` and
+   `book_state` are regenerable from `raw_events` **only within that window**;
+   older history is gone. Retention is anchored to the hourly discovery cycle (the
+   market-set recompute), so it prunes even on a failed/empty sweep. The durable
+   LLM graph (§5) is exempt — it is the one keep-forever store.
 2. **DuckDB is single-writer, single-process.** One process holds the read-write
    lock on `simplex.duckdb`; a second read-write open fails (a read-only open
    fails too while a writer holds it). This is why ingest is one process and why
@@ -441,7 +460,8 @@ ingest/                      # the ingest service — self-contained, deployable
     kalshi/  auth.py rest.py subscriber.py fixedpoint.py   # fixedpoint: fp/dollars decoding
     llm/     __init__.py client.py   # OpenRouter client: extract_market / classify_pair + taxonomy
     loops/   discovery.py catalog.py websocket.py snapshots.py audit.py extraction.py
-  tests/                     # pytest+hypothesis: predicates, DB atomicity, loops, extraction
+  tests/                     # pytest+hypothesis: predicates, DB atomicity, loops, extraction,
+                             #   clients (httpx mock), full end-to-end pipeline, opt-in live smoke
 docs/      ARCHITECTURE.md DEPLOY.md   # repo-level (shared across services)
 CLAUDE.md  README.md
 # future siblings (not yet created): trader/  viz/  libs/simplex_core/
