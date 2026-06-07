@@ -102,7 +102,7 @@ the same; if it only beats at end-of-cycle, that's the bug.
   `self.rt.heartbeats.beat(self.name)` once per market in the sweep loop, so a
   long catalog sweep keeps `/health` green. Added a regression test
   (`test_audit_beats_per_market_during_sweep`) and a `DEPLOY.md §8` note.
-  Hermetic suite green (`pytest` → 243 passed, 4 skipped).
+  Hermetic suite green (`pytest` → 244 passed, 4 skipped).
 
 ---
 

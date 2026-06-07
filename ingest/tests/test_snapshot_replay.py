@@ -7,11 +7,13 @@ Drives the real SnapshotBuilder over a tmp DuckDB with a minimal runtime.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
+from simplex_ingest import constants as C
 from simplex_ingest.events import EventType, NormalizedEvent
 from simplex_ingest.loops.snapshots import SnapshotBuilder
 from simplex_ingest.runtime import BookStore, Heartbeats
@@ -79,6 +81,35 @@ async def test_anchor_then_delta_applies(tmp_db):
     yes_bid, yes_ask, _ = st.book.top_of_book()
     assert yes_bid == 0.41                          # delta added a new top level
     assert yes_ask == round(1 - 0.55, 6)
+
+
+async def test_stale_markets_logged_as_single_aggregate(tmp_db, caplog):
+    """Stale markets must be reported as ONE aggregate count per tick, not one
+    INFO line per market — the per-market log floods the deploy logs (most
+    far-dated markets sit idle) and buries the greppable phrases the deploy
+    verification depends on."""
+    rt = _runtime(tmp_db)
+    builder = SnapshotBuilder(rt)
+    # Two markets whose last event is well past the stale cutoff, one fresh.
+    old = naive_utc(now_utc()) - timedelta(seconds=C.STALE_MARKET_SECONDS + 600)
+    fresh = naive_utc(now_utc()) - timedelta(seconds=5)
+    for mid, rts in (("S1", old), ("S2", old), ("FRESH", fresh)):
+        _activate(tmp_db, mid)
+        _insert(tmp_db, _snap(mid, [[0.40, 100]], [[0.55, 80]], seq=1, rts=rts))
+    # _activate replaces the active set each call; mark all three active at once.
+    tmp_db.set_active_set({"S1", "S2", "FRESH"})
+    _prime_cursor(builder, "S1")
+    builder._seeded = {"S1", "S2", "FRESH"}
+
+    with caplog.at_level(logging.INFO, logger="simplex.snapshot"):
+        await builder.tick(window_end=now_utc())
+
+    aggregate = [r for r in caplog.records if r.msg == "stale markets"]
+    assert len(aggregate) == 1, "expected exactly one aggregate stale line per tick"
+    assert aggregate[0].stale == 2          # S1 + S2, not FRESH
+    assert aggregate[0].active == 3
+    # The old per-market flood phrase must be gone entirely.
+    assert not any(r.msg == "stale market" for r in caplog.records)
 
 
 async def test_sequence_gap_requests_reset(tmp_db):

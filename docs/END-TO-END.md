@@ -140,6 +140,6 @@ heartbeat). DuckDB on the `/data` volume. See [`DEPLOY.md`](./DEPLOY.md).
 
 ## Tests
 
-`cd ingest && source venv/bin/activate && pytest` → 243 hermetic tests (units, loop behavior,
+`cd ingest && source venv/bin/activate && pytest` → 244 hermetic tests (units, loop behavior,
 batch routing/reconcile, spend gate, full end-to-end over a local WS server). `--run-live`
 adds 4 opt-in smoke tests against the Railway deploy.

@@ -150,6 +150,7 @@ class SnapshotBuilder:
 
         started = time.monotonic()
         rows: list[tuple] = []
+        stale_count = 0
         built = naive_utc(now_utc())
         ts = naive_utc(window_end)
         # Snapshot the active set: the applier may rebind self._active mid-build.
@@ -169,11 +170,17 @@ class SnapshotBuilder:
                     volumes.get(market, 0.0), r.last_trade_price, status, built,
                 )
             )
-            self._run_canaries(market, r, window_end)
+            if self._run_canaries(market, r, window_end):
+                stale_count += 1
             # Yield between markets (never mid-row) so a large active set can't
             # monopolize the event loop; each emitted row stays self-consistent.
             if (i + 1) % C.SNAPSHOT_ROW_YIELD_EVERY == 0:
                 await asyncio.sleep(0)
+
+        if stale_count:
+            # One aggregate line per tick, not one per stale market (the latter
+            # floods the logs — see _run_canaries).
+            log.info("stale markets", extra={"stale": stale_count, "active": len(active)})
 
         await asyncio.to_thread(self.rt.db.upsert_snapshots, rows)
         self._last_sample_ms = (time.monotonic() - started) * 1000.0
@@ -199,19 +206,25 @@ class SnapshotBuilder:
         self._sample_ms_sum = 0.0
         self._sample_count = 0
 
-    def _run_canaries(self, market: str, r, window_end: datetime) -> None:
+    def _run_canaries(self, market: str, r, window_end: datetime) -> bool:
+        """Run the per-market canaries for one grid build. Returns True if the
+        market is stale (open but idle past ``STALE_MARKET_SECONDS``). Staleness
+        is reported as a single aggregate count per tick by the caller — logging
+        one line per stale market floods the deploy logs (most far-dated markets
+        are idle most of the time), burying the greppable phrases the deploy
+        verification relies on."""
         reset = r.reset_canaries()
         if reset:
             log.warning("canary tripped; resetting book", extra={"market": market, "issues": sorted(reset)})
             request_reset(self.rt, market)
 
-        # Stale-market canary (informational only).
+        # Stale-market canary (informational only) — aggregated by the caller.
         last = r.last_event_received_ts
         open_market = (r.status or self._active_status.get(market)) in (None, "active")
         if open_market and last is not None:
             idle = (naive_utc(window_end) - naive_utc(last)).total_seconds()
-            if idle > C.STALE_MARKET_SECONDS:
-                log.info("stale market", extra={"market": market, "idle_s": round(idle)})
+            return idle > C.STALE_MARKET_SECONDS
+        return False
 
     # -- seeding + replay ---------------------------------------------------
 
