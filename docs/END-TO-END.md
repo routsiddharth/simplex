@@ -26,7 +26,7 @@ Monorepo layout: the ingest service is self-contained under `ingest/` (its own `
 |---|---|---|
 | **discovery** | hourly | Self-manages the `tracked_series` set via predicates (no manual allowlist); prunes time-series tables to the retention window; reconciles market resolution against Kalshi (`resolved_at` ← `settlement_ts`) and prunes the LLM graph 1 h after a market resolves. |
 | **catalog** | 5 min | Tracked series → the active (subscribed) market set, bounded by `MAX_ACTIVE_MARKETS` (kept highest-volume first) on top of the `MAX_TRACKED_SERIES` cap; logs the live volume distribution to tune `CATALOG_MIN_MARKET_VOLUME`. |
-| **websocket** | persistent | Orderbook / trade / lifecycle deltas → `raw_events` (`orjson` decode). |
+| **websocket** | persistent | Orderbook / trade / lifecycle deltas → `raw_events` (`orjson` decode). **Sharded** across `WS_SHARD_COUNT` (4) connections, partitioned by series (≤ Kalshi's 5-connection cap), each pacing its subscribe burst; a coordinator routes book-resets to the owning shard. All shards feed the one `raw_events` writer. |
 | **snapshot** | 10 s | A continuous **applier** drains `raw_events` into the books (yielding, so it can't starve the WS keepalive); a 10 s **sampler** reads the current books → the `snapshots` grid. Books checkpointed to `book_state`. |
 | **audit** | hourly | In-memory book vs REST orderbook reconciliation (sweeps every market at `AUDIT_ORDERBOOK_DEPTH=100`, `AUDIT_REST_CALLS_PER_SECOND=4`). Beats per-market mid-sweep so a large catalog keeps `/health` green. |
 | **extraction** | 5 min | Catalog markets → `market_semantics` + trust-tiered `market_edges` via LLMs, spend-shaped (see below). Soft-fails/idles without `OPENROUTER_API_KEY`. |

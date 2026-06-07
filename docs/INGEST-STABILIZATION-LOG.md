@@ -13,13 +13,15 @@ and the next steps** — written to continue in a fresh session.
 | | |
 |---|---|
 | **On `origin/main`** | `9529b6c` — everything below is pushed: Steps 1–4/6 + metrics (`0dae582`), audit-symmetry (`7a4be4a`), liquidity floor + bulk upsert (`64ea5f2`), cheap-model cost measure (`1044034`), docs (`9529b6c`). Working tree clean. |
-| **Tests** | `240 passed, 4 skipped` (live smoke skipped) |
+| **Tests** | `243 passed, 4 skipped` (live smoke skipped) — +3 WS sharding tests |
+| **WS sharding (Step 5)** | **BUILT 2026-06-07** — `N=4` connections, partition by series, paced subscribe burst, reset routing. Diagnosis behind it: connect-time burst death (see §7c/§5). Committed locally; awaiting deploy + live re-measure to confirm reconnects go flat. |
 | **Live status (re-measured ~22:43–22:46 UTC 06-06, on the deployed floor+bulk build)** | **snapshot fixed, WS still flaps.** `mean_sample_ms ≈ 1 800` (was ~25 000); grid clean **10 s**; `active=2907` (floor cut from 5 453); **zero `keepalive ping timeout`**. BUT `reconnects 18→22` over ~2.5 min ≈ **~1.5/min**, now closing with `ConnectionClosedError(None,None,None)` (no code), not keepalive. `reconciles=1` (incremental path now runs; was 0). |
 | **Verdict** | The snapshot-write root-cause was **correct** — floor+bulk killed the 25 s sampler, the 10 s grid, the market bloat, and the keepalive starvation. **But flapping is not gone:** with a *fast* sampler (loop unsaturated) the WS still drops ~1.5/min via a codeless `ConnectionClosedError`. Per §4/§5 decision tree this is the **Step 5 (WS sharding)** trigger — genuine per-connection throughput, not write saturation. Step 5's open knob (shard count `N`) is an **architect decision**; not built. |
 
-**Immediate next action:** decide Step 5 (WS sharding) — see §5 design + the open
-`N` knob. Everything the floor+bulk change targeted is confirmed fixed; the
-residual flap is a separate, per-connection cause.
+**Immediate next action:** deploy the WS-sharding build and re-measure — the
+pass/fail is `ws metrics reconnects` going **flat** and shards surviving > 60 s
+past their `ws initial subscribe`. Everything the floor+bulk change targeted is
+already confirmed fixed; sharding (§5) targets the separate connect-burst cause.
 
 ---
 
@@ -177,13 +179,38 @@ hypothesis to confirm on the next deploy.
 
 ---
 
-## 5. Step 5 — WS sharding (deferred, designed)
+## 5. Step 5 — WS sharding (**BUILT** 2026-06-07)
 
-**Status:** deferred by decision, pending the §4 re-measure. The plan sequences it
-"after Steps 1–2, only if reconnects still occur." The §2 data shows reconnects
-*do* still occur — **but** because of the sampler write (now being fixed in §3),
-not raw WS parse load (`frames_per_s` is low, ~45). So sharding is likely
-**unnecessary**; confirm after the floor+bulk deploy before building it.
+**Status: implemented.** The §7 re-measure settled the question the original
+"deferred" note left open: after the floor+bulk fix the loop is *not* saturated
+(`mean_sample_ms ≈ 1 800`) yet the connection still dropped ~1.5/min — and §7c's
+follow-up showed the death is a **connect-time burst**: every connection dies
+5–8 s after firing its ~2.9 k one-market-per-sid subscribes (codeless
+`ConnectionClosedError`). So sharding *is* needed, and the sizing criterion is
+**subscriptions per shard**, not steady-state `frames_per_s`.
+
+**Chosen `N` = 4.** Kalshi caps a user at **5 concurrent WS connections** (the
+one genuinely external constraint — confirmed against docs.kalshi.com), so
+`N ≤ 4` leaves headroom for the brief old+new overlap while one shard reconnects
+(4 steady + 1 transient = 5). 4 shards → ~725 markets each, a ~4× smaller connect
+burst and re-anchor blast radius. Paired with **subscribe-burst pacing**
+(`WS_SUBSCRIBE_CHUNK=50` @ `WS_SUBSCRIBE_PACING_SECONDS=0.05`), which targets the
+burst directly regardless of count. `WS_RECONNECT_RESET_SECONDS=30` resets a
+shard's backoff after a sustained connection so a one-off flap doesn't pin it at
+the 60 s cap.
+
+**Shipped:** `loops/websocket.py` rewritten as a **coordinator + N `_Shard`s**
+(see ARCHITECTURE.md "WebSocket subscriber — sharded"); `db.get_active_market_series`
+for the by-series partition; new `WS_SHARD_COUNT` / `WS_SUBSCRIBE_*` /
+`WS_COORD_TICK_SECONDS` / `WS_IDLE_POLL_SECONDS` / `WS_RECONNECT_RESET_SECONDS`
+constants; `test_websocket_loop.py` +3 tests (stable partition, by-series
+co-location, reset routing to the owning shard). `243 passed, 4 skipped`.
+
+**Original deferral note (for the record):** the §2 data showed reconnects
+occurring while `frames_per_s` was low (~45), so sharding looked *unnecessary* —
+the read was that the sampler write was the sole cause. §7 corrected that: the
+sampler write was *a* cause (keepalive starvation, now fixed) but the connect
+burst is a *separate* cause that the floor+bulk change didn't touch.
 
 **Why it might still be needed:** a single connection carries the whole
 orderbook-delta firehose; any drop re-anchors *every* book (`ws initial subscribe`

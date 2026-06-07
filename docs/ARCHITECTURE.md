@@ -160,29 +160,42 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   longer a fatal allowlist startup gate.
 - Closed/removed markets keep their rows and history; only `subscribed` flips.
 
-### WebSocket subscriber (`loops/websocket.py`)
-- Holds **one** persistent connection. Subscribes `orderbook_delta`
-  **one-market-per-subscription** (so each market's `seq` is an isolated,
-  monotonic stream → clean per-market gap detection), plus bulk `trade` and
-  `market_lifecycle_v2`.
-- Reconciles **incrementally** on the catalog signal (subscribe/unsubscribe per
-  market for orderbook; `update_subscription` add/delete for bulk channels) —
-  never a full reconnect. Dropping a market also drops its `BookStore` entry.
-- Parses each message (`orjson`, ~3–5× faster decode than stdlib `json` to free
-  the event loop sooner on the firehose) into `NormalizedEvent`s and buffers them
-  to `raw_events` (batched). Reconnects with exponential backoff + jitter,
-  unbounded; a full reconnect re-subscribes the entire active set
-  (`_subscribe_initial`). Rolls up `ws metrics` (frames/s, reconnect / reconcile
-  / reset counts) every `METRICS_LOG_INTERVAL_SECONDS`.
-- Drains **book-reset requests** (from the snapshot builder on a gap/canary, or
-  the audit loop on a large diff): re-subscribes that one market's orderbook to
-  force a fresh snapshot.
-- **Scaling note (planned, not built):** a single connection carrying the whole
-  firehose is the reconnect blast-radius risk — one drop re-anchors every book.
-  Sharding the orderbook subscriptions across N connections (by series), all
-  feeding the one in-process `raw_events` writer, would localize a drop to its
-  shard while keeping the single-writer invariant. Deferred until the
-  applier/sampler yields are confirmed insufficient in production (see §11).
+### WebSocket subscriber (`loops/websocket.py`) — sharded
+- **Sharded across `WS_SHARD_COUNT` (4) persistent connections.** A single
+  connection carrying all ~2.9 k subscriptions proved unstable in production
+  (each connection died ~5–8 s after its initial subscribe burst with a codeless
+  close, then re-anchored *every* book). Markets are partitioned **by series**
+  (`_shard_for` = stable crc32 of the series ticker → a series's markets stay on
+  one shard, co-locating its `seq` streams and localizing a drop's re-anchor to
+  that shard). Kalshi caps a user at **5 concurrent WS connections**, so the
+  shard count stays ≤ 4 to leave headroom for the brief old+new overlap during a
+  shard reconnect. **All shards feed the one in-process `raw_events` writer** —
+  the DuckDB single-writer invariant holds (one process, one writer).
+- Each shard subscribes `orderbook_delta` **one-market-per-subscription** (so each
+  market's `seq` is an isolated, monotonic stream → clean per-market gap
+  detection), plus bulk `trade` and `market_lifecycle_v2` over its subset. The
+  (re)subscribe burst is **paced** (`WS_SUBSCRIBE_CHUNK` at a time, with a
+  `WS_SUBSCRIBE_PACING_SECONDS` gap) so neither the outbound subscribes nor the
+  inbound snapshot flood overwhelms the connection at anchor time — the empirical
+  cause of the death. A shard with no assigned markets holds **no** connection.
+- A **coordinator** (the public `WebSocketLoop`) owns the cross-shard concerns:
+  it (re)partitions the active set on the catalog signal and hands each shard its
+  desired set (shards diff incrementally — subscribe/unsubscribe per market for
+  orderbook, `update_subscription` add/delete for bulk channels, never a full
+  reconnect); routes each **book-reset request** (snapshot builder on a
+  gap/canary, audit loop on a large diff) to the shard that owns that market;
+  beats the health heartbeat; and rolls up aggregate `ws metrics` (frames/s,
+  reconnect / reconcile / reset counts) every `METRICS_LOG_INTERVAL_SECONDS`.
+- Each shard parses messages (`orjson`, ~3–5× faster decode than stdlib `json` to
+  free the event loop sooner on the firehose) into `NormalizedEvent`s and buffers
+  them to `raw_events` (batched, shared `_buffer_lock`). Reconnects with
+  exponential backoff + jitter, unbounded; backoff resets after a connection
+  stays up ≥ `WS_RECONNECT_RESET_SECONDS` so a one-off flap doesn't pin the shard
+  at the 60 s cap forever.
+- **Ceiling (planned, not built):** all shards still parse on one core. If one
+  core can't keep up at a higher market count, the only invariant-safe path to
+  multi-core is reader *processes* handing frames over IPC to one writer process
+  (§11) — don't build until forced.
 
 ### Snapshot builder (`loops/snapshots.py`)
 - **Cadence:** emits on the `SNAPSHOT_INTERVAL_SECONDS` (10 s) grid boundary.

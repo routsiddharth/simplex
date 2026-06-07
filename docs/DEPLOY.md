@@ -20,10 +20,15 @@ shuts down cleanly on SIGTERM. Target platform: **Railway**. The same image suit
 any single-machine + mounted-volume host (Fly.io, a VM, etc.).
 
 **Hard rule — single instance only.** DuckDB is single-writer and the service
-holds one persistent Kalshi WebSocket. **Never run >1 replica** of this service
-against the same volume: a second process cannot open the DB read-write, and two
-WS connections would double-ingest. Scale **up** (bigger instance) if needed,
-never **out**. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.2.
+holds **`WS_SHARD_COUNT` (4) persistent Kalshi WebSocket connections** (sharded by
+series, all feeding the one writer). **Never run >1 replica** of this service
+against the same volume: a second process cannot open the DB read-write, it would
+double-ingest, *and* Kalshi caps a user at **5 concurrent WS connections** — one
+instance already uses 4, so a second replica would breach the cap and get
+connections refused. Scale **up** (bigger instance) if needed, never **out**.
+The shard count itself must stay ≤ 4 for the same 5-connection-cap reason (one
+slot of headroom for a shard's reconnect overlap). See
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) §9.2 and "WebSocket subscriber — sharded".
 
 ---
 

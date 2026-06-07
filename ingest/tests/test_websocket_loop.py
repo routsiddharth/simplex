@@ -40,6 +40,16 @@ def _activate(db, *market_ids):
     db.set_active_set(set(market_ids))
 
 
+def _activate_with_series(db, mapping):
+    """Activate ``{market_id: series_ticker}`` so partition-by-series can be
+    exercised (the default _activate puts everything in one series)."""
+    now = naive_utc(now_utc())
+    rows = [(m, "kalshi", m, None, None, series, f"{series}-E", None, None, None,
+             "active", None, now) for m, series in mapping.items()]
+    db.upsert_markets(rows)
+    db.set_active_set(set(mapping))
+
+
 async def _count_raw(db) -> int:
     await asyncio.to_thread(db.flush_raw_events)
     with db._lock:  # test-only direct read
@@ -129,6 +139,79 @@ async def test_reconcile_adds_new_market_on_catalog_signal(tmp_db, ws_server, ma
 
         got = await _wait_for(lambda: _async_true("KXM-B" in loop._current))
         assert got, "reconcile should pick up the newly-active market"
+    finally:
+        rt.shutdown.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_shard_for_is_stable_and_in_range():
+    from simplex_ingest.loops.websocket import _shard_for
+
+    keys = [f"KXSERIES{i}" for i in range(200)]
+    for k in keys:
+        idx = _shard_for(k, C.WS_SHARD_COUNT)
+        assert 0 <= idx < C.WS_SHARD_COUNT
+        assert _shard_for(k, C.WS_SHARD_COUNT) == idx  # deterministic
+    # crc32 spreads 200 distinct series across all shards (not all one bucket).
+    assert len({_shard_for(k, C.WS_SHARD_COUNT) for k in keys}) == C.WS_SHARD_COUNT
+
+
+async def test_partition_co_locates_a_series_and_covers_every_market(tmp_db, ws_server, make_signer):
+    # Three series, two markets each. A series's markets must land on ONE shard;
+    # all six must be subscribed (across shards) and stream to raw_events.
+    mapping = {
+        "AONE-1": "AONE", "AONE-2": "AONE",
+        "BTWO-1": "BTWO", "BTWO-2": "BTWO",
+        "CTRI-1": "CTRI", "CTRI-2": "CTRI",
+    }
+    rt = _ws_runtime(tmp_db, ws_server, make_signer())
+    _activate_with_series(tmp_db, mapping)
+
+    loop = WebSocketLoop(rt)
+    task = asyncio.create_task(loop.run())
+    try:
+        assert await _wait_for(lambda: _async_true(loop._current == set(mapping))), \
+            "every market should end up subscribed across the shards"
+        # Each series is co-located on a single shard.
+        for series in ("AONE", "BTWO", "CTRI"):
+            members = [m for m, s in mapping.items() if s == series]
+            owners = {loop._owner[m] for m in members}
+            assert len(owners) == 1, f"{series} markets split across shards {owners}"
+        # All six markets streamed snapshot+delta+trade -> >=18 raw rows.
+        assert await _wait_for(lambda: _raw_ge(tmp_db, 18))
+    finally:
+        rt.shutdown.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_reset_routes_only_to_the_owning_shard(tmp_db, ws_server, make_signer):
+    # Two series that hash to different shards (assert the premise, then route).
+    from simplex_ingest.loops.websocket import _shard_for
+    if _shard_for("AONE", C.WS_SHARD_COUNT) == _shard_for("ZED", C.WS_SHARD_COUNT):
+        # Pick any second series on a different shard so the test is meaningful.
+        candidates = (s for s in (f"S{i}" for i in range(50))
+                      if _shard_for(s, C.WS_SHARD_COUNT) != _shard_for("AONE", C.WS_SHARD_COUNT))
+        other = next(candidates)
+    else:
+        other = "ZED"
+    mapping = {"AONE-1": "AONE", f"{other}-1": other}
+    rt = _ws_runtime(tmp_db, ws_server, make_signer())
+    _activate_with_series(tmp_db, mapping)
+
+    loop = WebSocketLoop(rt)
+    task = asyncio.create_task(loop.run())
+    try:
+        assert await _wait_for(lambda: _async_true(loop._current == set(mapping)))
+        owner = loop._owner["AONE-1"]
+        assert loop._owner[f"{other}-1"] != owner  # genuinely different shards
+
+        rt.reset_requests.put_nowait("AONE-1")
+        assert await _wait_for(lambda: _async_true(loop._shards[owner].resets >= 1)), \
+            "the owning shard should perform the re-anchor"
+        # No other shard touched its reset path.
+        assert all(s.resets == 0 for s in loop._shards if s.index != owner)
     finally:
         rt.shutdown.set()
         task.cancel()

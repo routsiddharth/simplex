@@ -120,6 +120,12 @@ delay just stops growing here."""
 WS_RECONNECT_BACKOFF_FACTOR = 2.0
 """Multiplier applied each failed WS reconnect, before jitter."""
 
+WS_RECONNECT_RESET_SECONDS = 30.0
+"""A connection that stayed up at least this long counts as a sustained success,
+so its shard's reconnect backoff resets to the floor. Without this a shard that
+flapped hard once (backoff climbed to the 60 s cap) would keep waiting ~60 s
+between attempts forever, even after the underlying cause cleared."""
+
 WS_PING_INTERVAL_SECONDS = 10.0
 """websockets keepalive ping interval. Also bounds how quickly a silently dead
 connection is detected."""
@@ -136,6 +142,47 @@ WS_CHANNEL_LIFECYCLE = "market_lifecycle_v2"
 """Kalshi WS channel names. orderbook_delta is subscribed one-market-per-sid so
 each market gets an isolated, monotonic ``seq`` stream (clean per-market gap
 detection + re-anchor). trade and lifecycle are bulk subscriptions."""
+
+
+# --------------------------------------------------------------------------
+# WebSocket sharding
+# --------------------------------------------------------------------------
+# A single connection carrying ~2.9 k one-market-per-sid orderbook subscriptions
+# proved unstable in production: every connection died ~5–8 s after the initial
+# subscribe burst with a codeless ``ConnectionClosedError`` (not keepalive — the
+# loop was no longer saturated after the snapshot-write fix), then reconnected and
+# re-anchored *every* book. The cure is to (a) spread the subscriptions across a
+# few connections so each one's connect burst + blast-radius is smaller, and
+# (b) pace each connection's subscribe burst instead of firing it all at once.
+# See docs/INGEST-STABILIZATION-LOG.md §5 and docs/ARCHITECTURE.md.
+
+WS_SHARD_COUNT = 4
+"""Number of concurrent WS connections (shards). Markets are partitioned across
+shards **by series** (a series's markets stay co-located). Kalshi caps a user at
+**5 concurrent WS connections**, so this must stay ≤ 4 to leave headroom for the
+brief old+new overlap while one shard reconnects (4 steady + 1 transient = 5).
+All shards feed the single in-process ``raw_events`` writer — the DuckDB
+single-writer invariant is preserved (one process, one writer)."""
+
+WS_SUBSCRIBE_CHUNK = 50
+"""Orderbook subscribes are sent in chunks of this size with a pause between
+chunks (see WS_SUBSCRIBE_PACING_SECONDS) rather than all at once, so neither the
+outbound subscribe burst nor the inbound snapshot flood it triggers overwhelms
+the connection at anchor time — the empirical cause of the connect-time death."""
+
+WS_SUBSCRIBE_PACING_SECONDS = 0.05
+"""Pause between subscribe chunks. At ~725 markets/shard this adds <1 s to a
+(re)connect — negligible — while smoothing the snapshot burst over ~0.7 s."""
+
+WS_COORD_TICK_SECONDS = 0.5
+"""How often the shard coordinator wakes to dispatch book-reset requests to the
+owning shard, react to the catalog resubscribe signal (re-partition), beat the
+health heartbeat, and roll up metrics. Early-wakes on the resubscribe signal."""
+
+WS_IDLE_POLL_SECONDS = 5.0
+"""How often a shard with no assigned markets re-checks for an assignment (it
+holds no connection while empty, so it can't be event-driven by inbound frames).
+Also bounds how fast it picks up its first markets after a cold start."""
 
 
 # --------------------------------------------------------------------------

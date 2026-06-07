@@ -236,6 +236,17 @@ class Database:
             ).fetchall()
         return [{"market_id": r[0], "status": r[1]} for r in rows]
 
+    def get_active_market_series(self) -> dict[str, str]:
+        """``{market_id: series_ticker}`` for the subscribed set. Used by the WS
+        loop to partition orderbook subscriptions across shards by series (a
+        series's markets stay on one connection). Missing series → "" (the
+        partitioner falls back to the market_id as the hash key)."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT market_id, series_ticker FROM markets WHERE subscribed = TRUE"
+            ).fetchall()
+        return {r[0]: (r[1] or "") for r in rows}
+
     # -- tracked_series -----------------------------------------------------
 
     def get_tracked_series(self) -> list[str]:
