@@ -45,6 +45,37 @@ async def test_cap_enforced(tmp_db, make_fake_rest, make_runtime, make_admissibl
     assert "S009" not in tracked and "S010" in tracked
 
 
+async def test_series_allowlist_bypasses_predicates(
+    tmp_db, make_fake_rest, make_runtime, make_admissible_event, monkeypatch
+):
+    """With an allowlist set, discovery tracks EXACTLY the prefix-matching series —
+    including ones that would fail the predicates — and excludes high-volume
+    non-matching series. (Overrides the autouse fixture's empty allowlist.)"""
+    monkeypatch.setattr(C, "DISCOVERY_SERIES_ALLOWLIST_PREFIXES", ("KXWC",))
+    rest = make_fake_rest(events=[
+        make_admissible_event("KXWCGAME", volume=5000.0),        # matches, admissible
+        make_admissible_event("KXWCGROUPORDER", volume=10.0),    # matches but FAILS P3 → still kept
+        make_admissible_event("KXNBADRAFTPICK", volume=9000.0),  # high volume, no match → excluded
+        make_admissible_event("KXFEDDECISION", volume=8000.0),   # no match → excluded
+    ])
+    loop = DiscoveryLoop(make_runtime(tmp_db, rest))
+    await loop.discover()
+    assert set(tmp_db.get_tracked_series()) == {"KXWCGAME", "KXWCGROUPORDER"}
+
+
+async def test_series_allowlist_ignores_cap(
+    tmp_db, make_fake_rest, make_runtime, make_admissible_event, monkeypatch
+):
+    """The allowlist bypasses MAX_TRACKED_SERIES — more matching series than the
+    cap are all kept, never evicted."""
+    monkeypatch.setattr(C, "DISCOVERY_SERIES_ALLOWLIST_PREFIXES", ("KXWC",))
+    n = C.MAX_TRACKED_SERIES + 12
+    events = [make_admissible_event(f"KXWC{i:03d}", volume=1000.0 + i) for i in range(n)]
+    loop = DiscoveryLoop(make_runtime(tmp_db, make_fake_rest(events=events)))
+    await loop.discover()
+    assert len(tmp_db.get_tracked_series()) == n
+
+
 async def test_eviction_on_degradation(tmp_db, make_fake_rest, make_runtime,
                                        make_admissible_event):
     rt = make_runtime(tmp_db, make_fake_rest(events=[

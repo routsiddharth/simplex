@@ -6,6 +6,12 @@ series, admits each series that passes the structural + tradeability predicates
 (see :mod:`..discovery_predicates`), ranks the admitted set, caps it at
 MAX_TRACKED_SERIES, and rewrites the ``tracked_series`` table atomically.
 
+**Scoped override:** when ``DISCOVERY_SERIES_ALLOWLIST_PREFIXES`` is non-empty
+(currently ``("KXWC",)`` — World Cup 2026 only, an initial smoke-test scope-down),
+admission is by ticker-prefix match alone and the predicate/rank/cap path is
+bypassed entirely. Set the constant to ``()`` to restore predicate-driven
+discovery.
+
 The catalog poller reads ``tracked_series`` on its next tick (within one
 CATALOG_REFRESH_SECONDS), so discovery never has to wake the catalog or the WS
 loop directly — the existing resubscribe/reconcile path carries the delta.
@@ -83,11 +89,25 @@ class DiscoveryLoop:
             return
 
         stats = aggregate(events)
-        # Evaluate each series once; carry the Verdict alongside the stats so the
-        # row build below reuses it instead of re-running the predicates.
-        admitted = [(s, v) for s in stats.values() if (v := evaluate(s)).admit]
-        admitted.sort(key=lambda sv: rank_key(sv[0]), reverse=True)
-        top = admitted[: C.MAX_TRACKED_SERIES]
+        prefixes = C.DISCOVERY_SERIES_ALLOWLIST_PREFIXES
+        if prefixes:
+            # Scoped smoke-test mode (e.g. World Cup 2026 only): admit EXACTLY the
+            # series matching an allowlist prefix and bypass the predicates, the
+            # ranking, and the MAX_TRACKED_SERIES cap. The Verdict is still computed
+            # for the tracked_series row data (P-flags / counts), but it does not
+            # gate admission here. Sort by rank_key only to give `position` a
+            # stable, sensible value.
+            admitted = [(s, evaluate(s)) for s in stats.values()
+                        if s.ticker.startswith(prefixes)]
+            admitted.sort(key=lambda sv: rank_key(sv[0]), reverse=True)
+            top = admitted
+        else:
+            # Default path: evaluate each series once; carry the Verdict alongside
+            # the stats so the row build below reuses it. Admit on the predicates,
+            # rank, and cap at MAX_TRACKED_SERIES.
+            admitted = [(s, v) for s in stats.values() if (v := evaluate(s)).admit]
+            admitted.sort(key=lambda sv: rank_key(sv[0]), reverse=True)
+            top = admitted[: C.MAX_TRACKED_SERIES]
 
         now = naive_utc(now_utc())
         rows = []
@@ -214,7 +234,11 @@ def discover_once() -> None:
 
         stats = aggregate(events)
         scored = sorted(stats.values(), key=rank_key, reverse=True)
-        admitted = [s for s in scored if evaluate(s).admit]
+        prefixes = C.DISCOVERY_SERIES_ALLOWLIST_PREFIXES
+        if prefixes:
+            admitted = [s for s in scored if s.ticker.startswith(prefixes)]
+        else:
+            admitted = [s for s in scored if evaluate(s).admit]
 
         def _line(s: SeriesStats) -> str:
             v = evaluate(s)
@@ -225,11 +249,17 @@ def discover_once() -> None:
                 f"vol={s.volume_24h:,.0f}"
             )
 
-        print(f"\n=== Admitted ({len(admitted)}/{len(scored)}), top {C.MAX_TRACKED_SERIES} tracked ===")
-        for i, s in enumerate(admitted[: C.MAX_TRACKED_SERIES], 1):
-            print(f"{i:>3} {_line(s)}")
-        if len(admitted) > C.MAX_TRACKED_SERIES:
-            print(f"  ... {len(admitted) - C.MAX_TRACKED_SERIES} more admitted but over cap")
+        if prefixes:
+            print(f"\n=== Allowlist mode: prefixes {prefixes} — "
+                  f"{len(admitted)} series matched (predicates/rank/cap bypassed) ===")
+            for i, s in enumerate(admitted, 1):
+                print(f"{i:>3} {_line(s)}")
+        else:
+            print(f"\n=== Admitted ({len(admitted)}/{len(scored)}), top {C.MAX_TRACKED_SERIES} tracked ===")
+            for i, s in enumerate(admitted[: C.MAX_TRACKED_SERIES], 1):
+                print(f"{i:>3} {_line(s)}")
+            if len(admitted) > C.MAX_TRACKED_SERIES:
+                print(f"  ... {len(admitted) - C.MAX_TRACKED_SERIES} more admitted but over cap")
 
         rejected = [s for s in scored if not evaluate(s).admit]
         print(f"\n=== Top rejects ({len(rejected)} total) ===")

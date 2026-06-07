@@ -15,11 +15,26 @@ import pytest
 import websockets
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from simplex_ingest import constants as C
 from simplex_ingest.db import Database
 from simplex_ingest.discovery_predicates import EventStats, SeriesStats
 from simplex_ingest.kalshi.auth import KalshiSigner
 from simplex_ingest.llm import BatchResult, LLMError, MarketSemantics, PairClassification
 from simplex_ingest.runtime import Heartbeats
+
+
+# -- discovery scope --------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _default_predicate_discovery(monkeypatch):
+    """Exercise the predicate+rank+cap discovery path in tests by default.
+
+    Production currently pins discovery to a series allowlist
+    (``DISCOVERY_SERIES_ALLOWLIST_PREFIXES`` = World Cup 2026), which bypasses the
+    predicates/ranking/cap. The ranking engine still lives in the code as the
+    fallback, so the suite drives it with the allowlist OFF; the allowlist itself
+    is covered directly by ``test_discovery_loop.test_series_allowlist_*``."""
+    monkeypatch.setattr(C, "DISCOVERY_SERIES_ALLOWLIST_PREFIXES", ())
 
 
 # -- DuckDB -----------------------------------------------------------------

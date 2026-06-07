@@ -23,9 +23,31 @@ the incoherences: mispriced relationships, stale legs, latent arbitrage.
 It is built in stages. **Stages 1–3 (ingest, deploy, the LLM extraction layer)
 exist today.**
 
+> **⚠️ Current operating scope (2026-06-07) — World Cup 2026 only, 60 s grid.**
+> As an initial shake-out, the live deploy is deliberately scoped down to a single
+> small, internally-rich domain so the pipeline can be validated end-to-end before
+> the full-catalog firehose issues are solved. Two constants express this:
+> - **`DISCOVERY_SERIES_ALLOWLIST_PREFIXES = ("KXWC",)`** — discovery admits *only*
+>   the World Cup 2026 series (ticker prefix `KXWC`) and **bypasses the predicates,
+>   the ranking, and the `MAX_TRACKED_SERIES` cap** (§3 Discovery, §4). At
+>   full-catalog scale (~2.9 k markets / 30 ranked series) the WS feed produced a
+>   steady book-reset / `seq`-gap churn that obscured whether the downstream
+>   pipeline is correct; pinning to one coherent event (a World Cup has partitions,
+>   group orders, conditionals — the structure the solver wants) isolates that.
+> - **`SNAPSHOT_INTERVAL_SECONDS = 60`** — the materialized grid emits every 1 min
+>   instead of 10 s, cutting per-tick write and reset-churn pressure 6× while the
+>   product is shaken out.
+>
+> Both are single-constant reversions: set the allowlist to `()` to restore
+> predicate-driven discovery, and the interval back to `10` to restore the fine
+> grid (the solver was specced against a 10 s grid — re-tune when scaling back up).
+> The rest of this document describes the system **as designed** (full catalog,
+> 10 s grid); the scope-down changes *which* series and *how often*, not the
+> mechanics.
+
 | Stage | Scope | State |
 |------|-------|-------|
-| 1. Ingest | Live Kalshi books → normalized event log → 10s snapshot grid, with self-managing catalog discovery, book reconstruction, checkpointing, and an hourly REST reconciliation audit. | **Built** |
+| 1. Ingest | Live Kalshi books → normalized event log → snapshot grid (60 s; 10 s as designed), with self-managing catalog discovery (currently scoped to World Cup 2026; §1 callout), book reconstruction, checkpointing, and an hourly REST reconciliation audit. | **Built** |
 | 2. Deploy | Containerized, 24/7 on a mounted volume (Railway). | **Built** — see [`DEPLOY.md`](./DEPLOY.md) |
 | 3. Extraction | LLM layer over the catalog: per-market semantic representations + pairwise **typed relationship edges** (the market graph), trust-tiered (hard / soft / manual-review) for the solver. | **Built** — see §3 (Extraction), §5 |
 | 4. Solver | Max-entropy joint over related markets given snapshot marginals + the Stage-3 **edge constraints**; coherence/deviation scoring. | Planned |
@@ -40,9 +62,10 @@ the edge graph is a prerequisite, not a follow-on. Stage 3 builds it.
 
 What remains **unbuilt** is the solver itself and everything downstream of it.
 Stage 1 produces the regular, per-market gap-checked marginal time series the
-solver will consume — a 10 s grid, contiguous while the process runs but with
-possible **gaps across restarts** (the grid is forward-only; see §3), all fully
-regenerable from `raw_events`. Stage 3 produces the *structural* half — the
+solver will consume — a snapshot grid (60 s under the current scope-down, 10 s as
+designed), contiguous while the process runs but with possible **gaps across
+restarts** (the grid is forward-only; see §3), all fully regenerable from
+`raw_events`. Stage 3 produces the *structural* half — the
 relationship edges the solver combines with those marginals. Unlike the grid, the
 extraction outputs are **not** regenerable from `raw_events` (see §5, §9).
 
@@ -70,7 +93,7 @@ future solver in-process (see §11).
   └────────────────────┘  └───────────────────────┘  └───────────┬────────────┘
                                                                   │
         ┌──────────────────────────┐       ┌───────────────▼────────────┐
-        │  book audit (hourly)      │       │  snapshot builder (10 s)   │
+        │  book audit (hourly)      │       │  snapshot builder (60 s)   │
         │  in-memory book vs REST   │◀─────▶│  replays raw_events,        │
         │  → audit_results          │ books │  maintains order books,    │
         │  large diff → book reset  │       │  emits snapshots (LOCF),   │
@@ -116,6 +139,12 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   with_nested_markets=True)`), aggregates by series, applies the **predicates**
   (§4), ranks the admitted set, caps it at `MAX_TRACKED_SERIES` (30), and
   rewrites the `tracked_series` table **atomically**.
+- **Scoped override (current — §1 callout).** When
+  `DISCOVERY_SERIES_ALLOWLIST_PREFIXES` is non-empty (live: `("KXWC",)` — World
+  Cup 2026), the admit step is a **ticker-prefix match** and the predicates, the
+  ranking, and the `MAX_TRACKED_SERIES` cap are **all skipped** — every matching
+  open series is tracked. The predicate/rank/cap engine remains in the code as the
+  fallback for an empty allowlist (`()`).
 - **Never wipes the working set on a blip:** a transient empty sweep or a REST
   error leaves the prior `tracked_series` intact. `admitted_at` is preserved
   across re-admits.
@@ -198,7 +227,8 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   (§11) — don't build until forced.
 
 ### Snapshot builder (`loops/snapshots.py`)
-- **Cadence:** emits on the `SNAPSHOT_INTERVAL_SECONDS` (10 s) grid boundary.
+- **Cadence:** emits on the `SNAPSHOT_INTERVAL_SECONDS` grid boundary —
+  **currently 60 s** (scoped from the as-designed 10 s; §1 callout).
 - **Applier / sampler split.** `run()` drives two cooperating tasks on the one
   event loop rather than a single per-tick burst:
   - the **applier** continuously drains new `raw_events` into the books in small
@@ -414,6 +444,13 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
 
 ## 4. Discovery predicates (`discovery_predicates.py`)
 
+> **Currently bypassed (§1 callout).** While
+> `DISCOVERY_SERIES_ALLOWLIST_PREFIXES` pins discovery to World Cup 2026, the
+> predicates and ranking below do **not** gate admission — they still run (their
+> `Verdict` populates the `tracked_series` row flags) but every prefix-matching
+> series is admitted regardless. This section describes the predicate engine as it
+> behaves with the allowlist empty.
+
 Pure functions over per-series aggregated stats — no I/O. `aggregate(events)`
 groups a `get_events` sweep into `SeriesStats` (per-event `EventStats` +
 series-summed volume, tradeable markets only). `evaluate(stats)` returns a
@@ -452,7 +489,7 @@ lock; `raw_events` writes are buffered and flushed in batches.
 | `tracked_series` | Self-managed set of series to ingest. | Rewritten atomically each discovery cycle (admit/rank/cap). Replaces the YAML allowlist. PK `series_ticker`; `admitted_at` preserved across re-admits. |
 | `markets` | Catalog; `subscribed` flags the active WS set. | Rows never deleted — closed markets keep history, only `subscribed` flips. |
 | `raw_events` | **Append-only normalized event log — the source of truth (within the retention window).** | `received_ts` (our monotonic ingest clock) + DuckDB `rowid` order replay; `sequence` is the exchange per-subscription seq for gap detection. **Pruned** to the last `DATA_RETENTION_CYCLES` discovery cycles (not kept forever). |
-| `snapshots` | 10 s materialized grid — the marginal time series the solver reads. | Regenerable from `raw_events` **within the retention window**; pruned on the same cadence. PK `(ts, platform, market_id)` gives idempotency under window re-runs. |
+| `snapshots` | Materialized grid (60 s under the current scope-down, 10 s as designed) — the marginal time series the solver reads. | Regenerable from `raw_events` **within the retention window**; pruned on the same cadence. PK `(ts, platform, market_id)` gives idempotency under window re-runs. |
 | `book_state` | Serialized in-memory books for fast restart. | A replay accelerator, not a source of truth. |
 | `audit_results` | Per-market book-vs-REST reconciliation outcomes. | `no_diff`/`small_diff`/`large_diff`/`error`; `action_taken` none/`book_reset`. |
 | `market_semantics` | **Stage-3 per-market semantic cache (LLM-derived).** | PK `market_id`. Cached forever; re-extracted only when `extraction_version` bumps. `entities`/`dependencies` are JSON arrays. **Non-regenerable** (see below). |

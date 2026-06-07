@@ -24,11 +24,18 @@ get their own tag so tables stay multi-venue from day one."""
 # Snapshot builder
 # --------------------------------------------------------------------------
 
-SNAPSHOT_INTERVAL_SECONDS = 10
-"""Cadence of the 10s materialized grid. One row per active market per tick.
+SNAPSHOT_INTERVAL_SECONDS = 60
+"""Cadence of the materialized grid. One row per active market per tick.
 Lower = finer time resolution but more rows and more CPU per tick; the
 downstream coherence solver was specced against a 10s grid, so changing this
-ripples downstream."""
+ripples downstream.
+
+**Scoped to 60s (2026-06-07):** widened from 10s to 1 minute for the initial
+World-Cup-only smoke test (see DISCOVERY_SERIES_ALLOWLIST_PREFIXES). At a small,
+coherent market set the goal is to validate the pipeline end-to-end with far less
+per-tick write/firehose pressure — a 6× slower grid cuts snapshot-write and
+reset-churn load while the product is being shaken out. Restore 10s (and re-tune
+the solver's grid assumption) when scaling the market set back up."""
 
 CHECKPOINT_INTERVAL_SECONDS = 60
 """How often the in-memory order books are serialized to ``book_state``.
@@ -293,7 +300,29 @@ churn against the full-events REST sweep cost."""
 
 MAX_TRACKED_SERIES = 30
 """Hard cap on the tracked set. Admitted series beyond this are evicted worst-
-first by `rank_key`. Bounds the WS subscription firehose."""
+first by `rank_key`. Bounds the WS subscription firehose. Only applies in the
+default predicate+rank path — when DISCOVERY_SERIES_ALLOWLIST_PREFIXES is set the
+allowlist replaces predicates/rank/cap entirely."""
+
+DISCOVERY_SERIES_ALLOWLIST_PREFIXES: tuple[str, ...] = ("KXWC",)
+"""**Initial scope-down (2026-06-07): World Cup 2026 only.** When non-empty,
+discovery admits *exactly* the open series whose ticker starts with one of these
+prefixes and **bypasses the predicates, the `rank_key` ranking, and the
+MAX_TRACKED_SERIES cap** — the whole "rank all series and keep the top N" path is
+skipped. `KXWC` covers the FIFA World Cup 2026 series (`KXWCGAME`,
+`KXWCGROUPWIN`, `KXWCGROUPORDER`, `KXWC1H`, …).
+
+Rationale: at full catalog scale (~2.9k markets across 30 ranked series) the WS
+firehose produced a steady reset/seq-gap churn that obscured whether the rest of
+the pipeline (snapshot grid → extraction graph) is correct. Pinning to one small,
+internally-rich domain (a World Cup has partitions, group orders, conditionals —
+exactly the structure the solver wants) lets the product be validated end-to-end
+before the firehose/sharding issues are solved.
+
+Set to an empty tuple `()` to restore the predicate-driven admit/rank/cap path.
+The market-level bounds (`CATALOG_MIN_MARKET_VOLUME`, `MAX_ACTIVE_MARKETS`) still
+apply on top, as a backstop against a combinatorial series (e.g. group-order
+permutations)."""
 
 PREDICATE_PARTITION_MIN_MARKETS = 3
 """P1: a mutually-exclusive event needs at least this many tradeable markets to

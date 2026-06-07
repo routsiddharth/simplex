@@ -19,6 +19,17 @@ to a **mounted persistent volume**. It is env-driven, logs JSON to stdout, and
 shuts down cleanly on SIGTERM. Target platform: **Railway**. The same image suits
 any single-machine + mounted-volume host (Fly.io, a VM, etc.).
 
+> **⚠️ Current operating scope (2026-06-07): World Cup 2026 only, 60 s grid.** The
+> deploy is deliberately scoped down for an initial end-to-end shake-out — two
+> constants in `constants.py`: `DISCOVERY_SERIES_ALLOWLIST_PREFIXES = ("KXWC",)`
+> pins discovery to the World Cup 2026 series (predicates/rank/cap bypassed), and
+> `SNAPSHOT_INTERVAL_SECONDS = 60` slows the grid from 10 s. This shrinks the WS
+> subscription set and the per-tick write load, sidestepping the full-catalog
+> book-reset / `seq`-gap churn while the product is validated. Nothing else about
+> the deploy (image, volume, health, single-instance rule) changes. Revert by
+> setting the allowlist to `()` and the interval to `10`. See
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) §1.
+
 **Hard rule — single instance only.** DuckDB is single-writer and the service
 holds **`WS_SHARD_COUNT` (4) persistent Kalshi WebSocket connections** (sharded by
 series, all feeding the one writer). **Never run >1 replica** of this service
@@ -245,13 +256,15 @@ Watch the logs and confirm, in order — this is the end-to-end cutover signatur
 2. `catalog refreshed` — `series=N active_markets=M` (next catalog tick).
 3. `ws reconciled` — `added=M removed=0` (first convergence) / `ws initial subscribe`.
 4. `snapshots emitted` — `markets=M` within one `SNAPSHOT_INTERVAL`; the grid
-   timestamps should be a **clean `SNAPSHOT_INTERVAL_SECONDS` (10 s) apart** (the
-   applier/sampler split decouples grid cadence from drain load). Every
-   `METRICS_LOG_INTERVAL_SECONDS` the hot-path loops also roll up `snapshot
-   metrics` (`events_per_s`, `mean_sample_ms`, `books`, `active`) and `ws metrics`
-   (`frames_per_s`, `reconnects`, `reconciles`, `resets`) — watch `reconnects`
-   stay ~flat (no keepalive-timeout flapping) and `mean_sample_ms` stay well under
-   the 10 s budget. The catalog also logs `catalog volume distribution`
+   timestamps should be a **clean `SNAPSHOT_INTERVAL_SECONDS` (currently 60 s — see
+   the scope-down note in §1) apart** (the applier/sampler split decouples grid
+   cadence from drain load). Every `METRICS_LOG_INTERVAL_SECONDS` the hot-path
+   loops also roll up `snapshot metrics` (`events_per_s`, `mean_sample_ms`,
+   `books`, `active`) and `ws metrics` (`frames_per_s`, `reconnects`,
+   `reconciles`, `resets`) — watch `reconnects` stay ~flat (no keepalive-timeout
+   flapping), `resets` not climb steadily (steady reset growth = the book
+   `seq`-gap churn the World-Cup scope-down is meant to avoid), and
+   `mean_sample_ms` stay well under the 60 s budget. The catalog also logs `catalog volume distribution`
    (percentiles + counts below candidate floors) — the source for
    `CATALOG_MIN_MARKET_VOLUME` (**100** from the first deploy's distribution,
    which showed ~47 % of markets below 100 lifetime contracts; re-read the
@@ -339,7 +352,7 @@ python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env        # fill the 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
 python -m simplex_ingest    # six loops; GET :8080/health
-pytest                      # 247 tests
+pytest                      # 246 hermetic tests (+4 opt-in live)
 python -m simplex_ingest.loops.discovery     # dry-run: print admitted/rejected series
 python -m simplex_ingest.loops.extraction    # dry-run: extraction work plan (ingest stopped)
 ```
