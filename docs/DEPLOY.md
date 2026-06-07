@@ -339,7 +339,7 @@ python3 -m venv venv && source venv/bin/activate
 pip install -e ".[test]"
 cp .env.example .env        # fill the 4 Kalshi values (KALSHI_ENV=demo); OPENROUTER_API_KEY optional
 python -m simplex_ingest    # six loops; GET :8080/health
-pytest                      # 146 tests
+pytest                      # 247 tests
 python -m simplex_ingest.loops.discovery     # dry-run: print admitted/rejected series
 python -m simplex_ingest.loops.extraction    # dry-run: extraction work plan (ingest stopped)
 ```

@@ -82,8 +82,10 @@ The expensive part is Phase B, so spend is shaped two ways:
 > `deepseek/deepseek-v4-flash-20260423`, `PAIR_VERIFY_MODEL` =
 > `google/gemini-3.1-flash-lite-20260507` (kept a *different family* from the
 > primary so the trust gate stays independent). Restore the Sonnet/Opus tiers below
-> when extraction quality matters again. The `BATCH_*` (Anthropic-direct) ids are
-> unchanged. The design intent is unchanged and described as-designed below.
+> when extraction quality matters again. The `BATCH_*` (Anthropic-direct) ids run
+> their own cost tiering — Haiku on Stage A + Stage B primary, Sonnet on the verify
+> gate (re-tier 2026-06-07) — independent of these sync ids. The sync design intent
+> is described as-designed below.
 - `EXTRACTION_MODEL` (as designed) = `anthropic/claude-sonnet-4.6` — Stage A.
 - `PAIR_MODEL` (as designed) = `anthropic/claude-sonnet-4.6` — Stage B **primary** (Sonnet runs on every
   pair; Opus was demoted off the primary — that was the cost driver).
@@ -106,8 +108,12 @@ computed from `markets.closes_at` carried into the candidate path:
   completions`, rate-limited + retried. Latency-sensitive / short-horizon / critical-path work.
 - **Batch path** (`llm/batch.py`, Anthropic-direct) — long-horizon, latency-insensitive work
   routed to the **Message Batches API**: flat **50% off**, completes within ~1 h. Uses dashed
-  model ids (`BATCH_PAIR_MODEL = claude-sonnet-4-6`, etc.) mirroring the sync tiers — never
-  cross the dotted/dashed spellings. `BATCH_MAX_TOKENS=1500` is set because it's a mandatory
+  model ids — never cross the dotted/dashed spellings. `BATCH_EXTRACTION_MODEL` and
+  `BATCH_PAIR_MODEL = claude-haiku-4-5` run Stage A + the Stage B primary on the cheap
+  Haiku tier; the trust gate `BATCH_PAIR_VERIFY_MODEL = claude-sonnet-4-6` spends the
+  stronger Sonnet *only* on the high-confidence band (re-tier 2026-06-07), and being a
+  *different* model from the Haiku primary, a `trusted` edge still reflects two
+  independent models agreeing rather than one model agreeing with itself. `BATCH_MAX_TOKENS=1500` is set because it's a mandatory
   Anthropic field (the sync path intentionally leaves `max_tokens` unset — see
   [`LLM-COST-MIGRATION.md`](./LLM-COST-MIGRATION.md) §2).
 - The batch seam is **optional**: built only when `ANTHROPIC_API_KEY` is set. Absent it, the

@@ -499,17 +499,38 @@ cost-saving output cap discussed in the migration doc (which was deliberately no
 applied to the synchronous OpenRouter path). 1500 is generous headroom for the
 few-hundred-token semantics / classification JSON."""
 
-# Anthropic-direct (dashed) model ids. These mirror the OpenRouter (dotted) ids
-# above for the same logical tiers, but are spelled for the Anthropic API. Keep
-# them in lock-step with EXTRACTION_MODEL / PAIR_MODEL / PAIR_VERIFY_MODEL.
-BATCH_EXTRACTION_MODEL = "claude-sonnet-4-6"
-"""Stage A (semantics) on the batch path — mirrors EXTRACTION_MODEL."""
+# Anthropic-direct (dashed) model ids for the batch path — its OWN cost tiering,
+# NOT a mirror of the OpenRouter (dotted) sync ids above. The batch path spends a
+# cheap Haiku workhorse on the high-volume bulk (Stage A semantics + Stage B
+# primary) and reserves a stronger Sonnet for the low-volume Stage B verify (trust)
+# gate. (Cost re-tier 2026-06-07 — see docs/LLM-COST-MIGRATION.md §1.)
+BATCH_EXTRACTION_MODEL = "claude-haiku-4-5"
+"""Stage A (semantics) on the batch path. **Cost choice (2026-06-07):** Haiku
+rather than Sonnet — semantics extraction is structured, low-difficulty work well
+within Haiku's class, and at $1/$5 per M Haiku is the cheapest Anthropic tier. This
+is the highest-volume Anthropic call (one per market, plus a full re-extract on any
+EXTRACTION_PROMPT_VERSION bump), so it's the biggest single spend lever. Restore
+`claude-sonnet-4-6` if semantics quality regresses."""
 
-BATCH_PAIR_MODEL = "claude-sonnet-4-6"
-"""Stage B primary on the batch path — mirrors PAIR_MODEL."""
+BATCH_PAIR_MODEL = "claude-haiku-4-5"
+"""Stage B primary (pair relationship) on the batch path. **Cost choice
+(2026-06-07):** Haiku rather than Sonnet — pairwise classification is structured
+work, and this is the other high-volume call (≈one per candidate pair, which grows
+~quadratically with markets). Sub-trusted edges rest on this call alone; trusted
+candidates (≥ EDGE_TRUSTED_CONFIDENCE) are re-checked by the stronger
+BATCH_PAIR_VERIFY_MODEL below. Restore `claude-sonnet-4-6` if primary quality
+regresses."""
 
-BATCH_PAIR_VERIFY_MODEL = "claude-opus-4-8"
-"""Stage B verify on the batch path — mirrors PAIR_VERIFY_MODEL."""
+BATCH_PAIR_VERIFY_MODEL = "claude-sonnet-4-6"
+"""Stage B verify (trust gate) on the batch path. **Cost choice (2026-06-07):**
+Sonnet — the stronger guard, spent deliberately on the band that matters most.
+Verify fires only on high-confidence candidates (≥ EDGE_TRUSTED_CONFIDENCE), which
+promote to the solver's *hard constraints*, so a wrong one is the highest-blast-
+radius failure; that band is low-volume, so a pricier model here barely moves total
+spend. It also satisfies the trust-gate invariant: Sonnet is a *different* model
+from BATCH_PAIR_MODEL (Haiku), so a promoted `trusted` edge reflects two independent
+models agreeing, not one model agreeing with itself. Drop to `claude-haiku-4-5` only
+if verify volume itself becomes a cost problem."""
 
 BATCH_BULK_SEMANTICS_THRESHOLD = 100
 """Stage A backlog size (markets missing current-version semantics) at/above which

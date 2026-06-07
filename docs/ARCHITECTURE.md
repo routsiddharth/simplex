@@ -321,8 +321,9 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     model (`PAIR_VERIFY_MODEL`, deliberately different from `PAIR_MODEL`) agrees
     on the relationship type. Agreement → `trusted` (`agreement_status='agreed'`);
     disagreement → `review`. The 2× spend lands only on this highest-blast-radius
-    band — and it's the strongest (**Opus**) tier, since this one decision gates
-    the hard-constraint set.
+    band — and it's spent on a stronger, independent verify tier (`PAIR_VERIFY_MODEL`
+    / `BATCH_PAIR_VERIFY_MODEL`), since this one decision gates the hard-constraint
+    set.
   - `≥ EDGE_SOFT_CONFIDENCE` (0.6) → `soft` (a soft solver constraint).
   - below that → `review` (the manual-review queue: the query
     `trust_tier='review' AND review_status='pending'`).
@@ -339,7 +340,11 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     near-zero spend during ingest stabilization while the Anthropic batch path is
     creditless — restore the Sonnet/Opus tiers when extraction quality matters. The
     tiering *design* (cheap primary, independent premium gate) is unchanged; only
-    the slugs in `constants.py` differ for now.
+    the slugs in `constants.py` differ for now. The **batch path runs its own
+    tiering** (re-tier 2026-06-07): `BATCH_EXTRACTION_MODEL` / `BATCH_PAIR_MODEL` =
+    **Haiku** for the high-volume Stage A + Stage B-primary bulk, and
+    `BATCH_PAIR_VERIFY_MODEL` = **Sonnet** reserved for the low-volume trust gate —
+    it is *not* a mirror of the sync ids.
   - **Time-to-resolution gate (`pair_candidates.route_pair`).** An edge's useful
     life is `min(life of A, life of B)` — it dies when *either* endpoint settles
     (the graph is pruned 1h after resolution). So each candidate is gated on
@@ -357,9 +362,22 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     primary and verify always travel the same transport** (a batched primary's
     verify is itself batched, joining the next wave). The two providers use
     **different model-id spellings** — OpenRouter dotted (`anthropic/claude-…`),
-    Anthropic dashed (`claude-…`); the `BATCH_*` model constants mirror the sync
-    ones. The batch path is **optional**: with no `ANTHROPIC_API_KEY`, batch-routed
-    work degrades to sync (still produced, at full price).
+    Anthropic dashed (`claude-…`); the `BATCH_*` model constants run their own
+    tiering (Haiku bulk / Sonnet verify, above), not a mirror of the sync ids. The
+    batch path is **optional**: with no `ANTHROPIC_API_KEY`, batch-routed work
+    degrades to sync (still produced, at full price).
+  - **Prompt economy — length is not the lever, volume is.** Prompts are kept
+    deliberately compact: Phase B classifies off the **Stage-A semantic record**
+    (`_market_block` — `underlying_event` / `resolves_*` / `entities`), never the
+    raw market description, so a pair prompt is a few hundred tokens regardless of
+    how verbose the underlying market is. The raw `description` + `resolution_criteria`
+    are sent **only** at Stage A (once per market, cached forever). Prompt **caching
+    is a deliberate no-op here**: the repeated system prefix is ~190 tokens, far
+    below the model's minimum cacheable prefix (≈2048 Sonnet / 4096 Haiku), so
+    `cache_control` would never engage — don't add it. The cost driver is therefore
+    the *number* of calls (the O(n²) candidate set), not per-call length — which is
+    what `PAIR_ENTITY_OVERLAP_MIN`, the time-to-resolution gate, and the
+    verify-only-on-≥0.85 gate exist to bound.
 - **Batch state machine (submit-now / retrieve-later).** A batch crosses cycles:
   cycle *N* submits and persists `(batch_id, purpose, the work it covers, prompt
   version)` to the durable `llm_batches` table; a later cycle's **reconcile** phase

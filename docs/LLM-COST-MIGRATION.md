@@ -60,9 +60,12 @@ Relevant constants (`constants.py`): `EXTRACTION_MODEL`, `PAIR_MODEL`,
 only as an *escalation* for the ambiguous middle band, or as the verifier. This changes
 the cost *rate*, which can beat the batch discount on its own.
 
-> Open decision (architect's call): Sonnet vs Haiku for the primary pass — a
-> quality/cost tradeoff that depends on how clean the taxonomy classifications stay at
-> lower capability. Validate against a sample before committing.
+> **Resolved (2026-06-07, architect's call):** on the Anthropic batch path the
+> primary pass *and* Stage A semantics run on **Haiku** (`BATCH_EXTRACTION_MODEL` /
+> `BATCH_PAIR_MODEL` = `claude-haiku-4-5`), with **Sonnet**
+> (`BATCH_PAIR_VERIFY_MODEL` = `claude-sonnet-4-6`) reserved for the Stage B
+> verify/trust gate — quality spend concentrated on the low-volume hard-constraint
+> band. Validate against a sample if taxonomy quality looks off at Haiku capability.
 
 ### 2. `max_tokens` — sync path left uncapped (as decided); batch sets the API-mandated field
 
