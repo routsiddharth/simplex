@@ -14,7 +14,7 @@ and the next steps** — written to continue in a fresh session.
 |---|---|
 | **On `origin/main`** | `9529b6c` — everything below is pushed: Steps 1–4/6 + metrics (`0dae582`), audit-symmetry (`7a4be4a`), liquidity floor + bulk upsert (`64ea5f2`), cheap-model cost measure (`1044034`), docs (`9529b6c`). Working tree clean. |
 | **Tests** | `243 passed, 4 skipped` (live smoke skipped) — +3 WS sharding tests |
-| **WS sharding (Step 5)** | **BUILT 2026-06-07** — `N=4` connections, partition by series, paced subscribe burst, reset routing. Diagnosis behind it: connect-time burst death (see §7c/§5). Committed locally; awaiting deploy + live re-measure to confirm reconnects go flat. |
+| **WS sharding (Step 5)** | **BUILT + DEPLOYED + VERIFIED 2026-06-07** — `N=4` connections, partition by series, paced subscribe burst, reset routing. Live (02:47–03:15 UTC): **`reconnects` FLAT** (17 across 5 rollups), ~0.18 conn-err/min, zero keepalive, snapshots clean 10 s, extraction running — see §8. Diagnosis: connect-time burst death (§8a). Deployed via `railway up`; commit local, **needs `git push origin main`** (classifier-blocked for the agent). |
 | **Live status (re-measured ~22:43–22:46 UTC 06-06, on the deployed floor+bulk build)** | **snapshot fixed, WS still flaps.** `mean_sample_ms ≈ 1 800` (was ~25 000); grid clean **10 s**; `active=2907` (floor cut from 5 453); **zero `keepalive ping timeout`**. BUT `reconnects 18→22` over ~2.5 min ≈ **~1.5/min**, now closing with `ConnectionClosedError(None,None,None)` (no code), not keepalive. `reconciles=1` (incremental path now runs; was 0). |
 | **Verdict** | The snapshot-write root-cause was **correct** — floor+bulk killed the 25 s sampler, the 10 s grid, the market bloat, and the keepalive starvation. **But flapping is not gone:** with a *fast* sampler (loop unsaturated) the WS still drops ~1.5/min via a codeless `ConnectionClosedError`. Per §4/§5 decision tree this is the **Step 5 (WS sharding)** trigger — genuine per-connection throughput, not write saturation. Step 5's open knob (shard count `N`) is an **architect decision**; not built. |
 
@@ -279,6 +279,52 @@ Step 5 is designed (§5) and gated on the architect picking shard count `N`
 on one connection). Not built pending that decision. Secondary: characterize the
 codeless close further (Kalshi idle-drop vs. throughput) before committing to N.
 
+---
+
+## 8. Sharding deployed + verified (2026-06-07 ~02:47–03:15 UTC) ✅
+
+WS sharding (§5, `N=4`) was built and deployed (via `railway up` — direct push to
+`main` is still classifier-blocked; the commit `feat: shard the WS subscriber…`
+is local, awaiting a manual `git push`). Measured ~25 min after the SUCCESS
+deploy at 02:47 UTC.
+
+### 8a. The diagnosis that set `N` (the §7c follow-up)
+The codeless close was a **connect-time burst death**: each single connection died
+**5–8 s after firing its ~2 907 one-market-per-sid subscribes** (22:43:56 sub →
+22:44:04 close; 22:44:18 → 22:44:24; 22:46:29 → 22:46:34). Reducing 5453→2907 hadn't
+helped → the survivable threshold is well below 2907. So the sizing criterion is
+**subscriptions per shard**, and the binding constraint is Kalshi's **5-connection
+cap** → `N=4` (~725/shard) + **paced** subscribe bursts.
+
+### 8b. Result — flapping eliminated, pipeline healthy ✅
+```
+ws metrics   reconnects 17 → 17 → 17 → 17 → 17  over 03:11–03:15 — FLAT (0/min)
+             (was ~1.5/min of 5–8 s connect-burst deaths). shards=4, subscribed=2873.
+conn errors  1 in 5 min (~0.18/min, was ~1.5/min);  zero keepalive timeouts
+shards live  shard 0 (878 mkts) ran 02:59:17→02:59:59+ — survives indefinitely now
+snapshots    emitted clean ~10 s, markets 2873–2874;  mean_sample_ms ~1.9–2.4 s
+extraction   Stage 3 llm-usage lines present — full pipeline flowing end to end
+```
+
+### 8c. The reset rate was market churn, not a bug
+Early on, `resets` ran ~3.3/s and looked like a regression. The trend settled it:
+`resets 3197→3235→3238→3238→3238` **tracked `frames_per_s` exactly** (196→30→1.4→
+1.9→3.1) — as the live World Cup books (`KXWCGAME-26JUN27…`, `KXWCGROUPORDER…`)
+quieted, gaps (and resets) **stopped entirely**. Each reset hit a *distinct*
+high-churn market once (not a loop on one market). So the elevated rate was genuine
+seq-gaps in fast live-sports orderbooks self-healing via re-anchor — the higher
+number vs the old 0.31/s was the live games (03:00 UTC) vs a calm 22:46 UTC window.
+*(If a future calm-market window still shows a high reset floor, the next lever is
+per-`sid` seq tracking so a re-subscribe's stragglers can't trip a false gap — not
+needed on this evidence.)*
+
+### 8d. Verdict
+**The WS reconnect-death-loop is resolved.** Root causes were two, fixed in two
+steps: (1) the per-tick snapshot write saturating the loop → keepalive starvation
+(floor + bulk upsert, §3/§7); (2) the connect-time subscribe burst on one fat
+connection → codeless close (shard `N=4` + paced subscribes + reset routing, §5/§8).
+243 tests pass incl. the real-socket end-to-end. **Remaining:** `git push origin
+main` for the permanent record (the deploy is live from `railway up`).
 
 ---
 
