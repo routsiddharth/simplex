@@ -49,6 +49,15 @@ def configure_logging(level: str) -> None:
     handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
 
+    # Quiet noisy third-party loggers. httpx emits one INFO line per request
+    # ("HTTP Request: GET ... 200 OK"); the catalog/discovery loops make hundreds
+    # of REST calls per cycle (one per series), which drowns our own structured
+    # logs. Pin them to WARNING so real failures still surface. websockets is
+    # likewise chatty at the protocol level. Our own `simplex.*` loggers are
+    # unaffected (they inherit the root level set above).
+    for noisy in ("httpx", "httpcore", "websockets", "websockets.client"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 class _LoopAdapter(logging.LoggerAdapter):
     """Stamps every record with its loop name; merges per-call ``extra``."""
