@@ -340,3 +340,51 @@ main` for the permanent record (the deploy is live from `railway up`).
 - Tests: `test_snapshot_replay.py`, `test_reconstruct.py`, `test_fixedpoint.py`,
   `test_audit_diff.py`, `test_catalog_loop.py`, `test_catalog_reads_db.py`.
 - Docs: `ARCHITECTURE.md`, `DEPLOY.md`, `END-TO-END.md`, this log.
+
+---
+
+## 9. WS seq-gap reset storm — root cause + fix (2026-06-08)
+
+**Symptom.** Steady `sequence gap; resetting book` + `ws reset market` churn —
+`resets` climbing into the tens of thousands (12.6k at 9h uptime), books mostly
+de-anchored, depth-grid columns largely empty. Connections themselves were stable
+(`reconnects` flat at ~5), so it was *not* connection flapping.
+
+**Root cause — `seq` is per-connection, not per-market.** The reset is driven by
+`reconstruct.py`'s per-market forward-gap check (`got > last_sequence + 1`). The
+design assumed one-market-per-`sid` gives each market an isolated monotonic `seq`
+(ARCHITECTURE §6/§7, the `reference-kalshi-api` memory). Production falsifies that:
+in the gap logs the `got` value is a **single counter climbing across every market**
+regardless of series, while `expected` is genuinely per-market —
+
+| time | market (unrelated series) | expected | got |
+|---|---|---:|---:|
+| 16:11 | KXWCGAME-…-TIE | 820 | 11,448 |
+| 16:13 | KXWCBTTS-…MEXRSA | 47 | 12,338 |
+| 16:22 | KXWCTOTALGOAL-26FT-320 | 2,641 | 16,456 |
+| 16:25 | KXWCGAME-…URUCPV | 486 | 18,154 |
+
+So between any two of a market's deltas, *other* markets' deltas bump the shared
+counter → `got ≫ expected` → false "gap" → reset → re-subscribe → fresh snapshot
+re-anchors at the high global `seq` → the market's next delta is again far ahead →
+gap again. A self-sustaining storm; the ~16 logs/min is the throughput of the
+reset round-trip, not the true false-gap rate (de-anchored books drop deltas
+silently without logging).
+
+**Fix (decided: tolerate gaps).** `reconstruct.py` no longer resets on a forward
+gap — it resyncs `last_sequence` and applies the delta (the book is almost always
+fine; the "gap" was other markets). `seq` is kept only as a duplicate/replay guard
+(`seq ≤ last_sequence` → drop). The two **real** corruption backstops, which don't
+depend on per-market `seq`, are unchanged: the structural canaries (crossed book /
+negative size / out-of-range) and the hourly REST audit (in-memory book vs REST →
+reset on a large diff). Trade-off: we lose per-market *missed-delta* detection via
+`seq` — but it was non-functional (firing on a global counter), and for a 60 s grid
+with an hourly audit that's the right call. Expected: `resets` collapses to ~0,
+books stay anchored, the depth grid populates.
+
+**Also:** quieted httpx/httpcore/websockets INFO logging (one `HTTP Request: …`
+line per catalog/discovery REST call was drowning the structured logs).
+
+**Files:** `reconstruct.py` (tolerate gap), `log.py` (quiet third-party loggers);
+tests `test_reconstruct.py` + `test_snapshot_replay.py` updated; docs ARCHITECTURE
+§3/§6/§7 + this log; `reference-kalshi-api` memory corrected.

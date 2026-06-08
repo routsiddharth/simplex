@@ -60,12 +60,17 @@ def test_duplicate_or_old_seq_is_dropped():
     assert dict(r.book.yes) == before                                  # not double-applied
 
 
-def test_sequence_gap_returns_reset():
+def test_sequence_gap_is_tolerated_and_applied():
+    # Kalshi's orderbook seq is per-CONNECTION, so a forward "gap" is almost always
+    # other markets' deltas bumping the shared counter, not a missed delta for this
+    # market. We resync + apply rather than reset (resetting caused a perpetual reset
+    # storm). Genuine corruption is caught by canaries + the REST audit instead.
     r = BookReconstructor("M")
     r.apply(_snap([[0.40, 100]], [], seq=5))
     r.apply(_delta("yes", 0.41, 30, seq=6))
-    assert r.apply(_delta("yes", 0.42, 10, seq=8)) is ApplyResult.RESET  # expected 7
-    assert r.last_sequence == 6                                          # not advanced past the gap
+    assert r.apply(_delta("yes", 0.42, 10, seq=8)) is ApplyResult.OK  # forward gap tolerated
+    assert r.last_sequence == 8                                        # resynced forward
+    assert r.top_of_book()[0] == 0.42                                 # the delta was applied
 
 
 # -- checkpoint replay floor ------------------------------------------------

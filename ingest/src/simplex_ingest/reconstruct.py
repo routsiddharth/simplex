@@ -10,10 +10,14 @@ A :class:`BookReconstructor` owns one market's reconstruction state
     reconstructor.restore_checkpoint(cp)             # resume after a restart
 
 The reconstruction invariants live here, not scattered across the snapshot loop:
-a snapshot anchors the book; deltas apply only while anchored and only on the
-next contiguous ``seq``; a duplicate/old ``seq`` is dropped; a forward gap returns
-``RESET``; ``replay_floor_ts`` skips events already folded into a checkpoint. The
-loop just forwards drained events and acts on a ``RESET``.
+a snapshot anchors the book; deltas apply only while anchored; a duplicate/replayed
+``seq`` (≤ the last applied) is dropped; a **forward gap is tolerated** — resync and
+apply — because Kalshi's orderbook ``seq`` is per-*connection*, not per-market, so a
+forward jump is almost always other markets' deltas bumping the shared counter, not
+a missed delta for this market (see docs/INGEST-STABILIZATION-LOG.md §9).
+``replay_floor_ts`` skips events already folded into a checkpoint. Book **resets**
+no longer come from seq gaps; they come from the structural canaries and the hourly
+REST audit (the snapshot/audit loops call ``runtime.request_reset`` directly).
 """
 
 from __future__ import annotations
@@ -36,7 +40,10 @@ _RESET_CANARIES = {"crossed_book", "negative_size", "out_of_range_price"}
 
 class ApplyResult(Enum):
     OK = auto()       # event folded in (or harmlessly dropped)
-    RESET = auto()    # a sequence gap: caller should request a book reset
+    RESET = auto()    # caller should request a book reset. Reserved: apply() no
+                      # longer returns this (seq gaps are tolerated; resets come
+                      # from canaries/audit), but the snapshot loop still honors it,
+                      # so a future genuine per-market desync signal can use it.
 
 
 class BookReconstructor:
@@ -74,7 +81,8 @@ class BookReconstructor:
     # -- mutation -----------------------------------------------------------
 
     def apply(self, event: dict[str, Any]) -> ApplyResult:
-        """Fold one ``raw_events`` row into the book. Returns RESET on a seq gap."""
+        """Fold one ``raw_events`` row into the book. Returns OK; seq gaps are
+        tolerated (resync + apply) — resets come from canaries/audit, not here."""
         rts = event["received_ts"]
         if self.replay_floor_ts is not None and rts is not None and rts <= self.replay_floor_ts:
             return ApplyResult.OK  # already folded into the checkpoint
@@ -96,16 +104,20 @@ class BookReconstructor:
         elif et == EventType.ORDERBOOK_DELTA.value:
             if not self.anchored:
                 return ApplyResult.OK  # wait for a snapshot to anchor
-            if self.last_sequence is not None and seq is not None:
-                if seq <= self.last_sequence:
-                    return ApplyResult.OK  # duplicate / out of order
-                if seq > self.last_sequence + 1:
-                    log.warning(
-                        "sequence gap; resetting book",
-                        extra={"market": self.market_id,
-                               "expected": self.last_sequence + 1, "got": seq},
-                    )
-                    return ApplyResult.RESET
+            # Kalshi's orderbook `seq` is per-CONNECTION, not per-market — confirmed
+            # in production (the gap log's `got` is one counter climbing across every
+            # market, while each market's `expected` is its own; see
+            # docs/INGEST-STABILIZATION-LOG.md §9). So a forward "gap" is almost
+            # always just *other* markets' deltas bumping the shared counter between
+            # two of THIS market's deltas — not a missed delta for this market.
+            # Resetting on it caused a perpetual reset storm that left books
+            # de-anchored and the depth grid empty, so we DON'T reset on a gap: we
+            # resync and apply. Genuine corruption is still caught by the structural
+            # canaries and the hourly REST audit (the two reset paths that don't
+            # depend on per-market seq). A seq we've already passed is still dropped
+            # as a duplicate/replay (guards against a re-sent event double-applying).
+            if self.last_sequence is not None and seq is not None and seq <= self.last_sequence:
+                return ApplyResult.OK  # duplicate / replay
             side = payload.get("side")
             price = payload.get("price")
             delta = payload.get("delta")

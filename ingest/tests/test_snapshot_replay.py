@@ -112,7 +112,7 @@ async def test_stale_markets_logged_as_single_aggregate(tmp_db, caplog):
     assert not any(r.msg == "stale market" for r in caplog.records)
 
 
-async def test_sequence_gap_requests_reset(tmp_db):
+async def test_sequence_gap_is_tolerated_not_reset(tmp_db):
     rt = _runtime(tmp_db)
     builder = SnapshotBuilder(rt)
     mid = "M2"
@@ -124,12 +124,18 @@ async def test_sequence_gap_requests_reset(tmp_db):
     await builder.tick(window_end=now_utc())
     assert rt.book_store.get(mid).anchored
 
-    # seq jumps 6 -> 8 (expected 7): gap -> reset requested, book de-anchored.
+    # seq jumps 6 -> 8: Kalshi's orderbook seq is per-connection, so this is other
+    # markets' deltas bumping the shared counter, not a missed delta for M2. We
+    # tolerate it: apply the delta, stay anchored, request NO reset (resetting on
+    # this false signal caused a perpetual reset storm).
     _insert(tmp_db, _delta(mid, "yes", 0.42, 10, seq=8, rts=base + timedelta(seconds=2)))
     await builder.tick(window_end=now_utc())
 
-    assert rt.reset_requests.get_nowait() == mid
-    assert not rt.book_store.get(mid).anchored
+    assert rt.reset_requests.empty()                  # no reset requested
+    r = rt.book_store.get(mid)
+    assert r.anchored                                 # book stays anchored
+    assert r.last_sequence == 8                        # resynced forward
+    assert r.top_of_book()[0] == 0.42                  # the gapped delta was applied
 
 
 async def test_cold_start_cursor_does_not_rescan_history(tmp_db):

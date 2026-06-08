@@ -200,9 +200,13 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
   shard count stays ≤ 4 to leave headroom for the brief old+new overlap during a
   shard reconnect. **All shards feed the one in-process `raw_events` writer** —
   the DuckDB single-writer invariant holds (one process, one writer).
-- Each shard subscribes `orderbook_delta` **one-market-per-subscription** (so each
-  market's `seq` is an isolated, monotonic stream → clean per-market gap
-  detection), plus bulk `trade` and `market_lifecycle_v2` over its subset. The
+- Each shard subscribes `orderbook_delta` **one-market-per-subscription** (one
+  `sid` per market, so unsubscribe/reset is per-market), plus bulk `trade` and
+  `market_lifecycle_v2` over its subset. **Note (2026-06-08):** this was *intended*
+  to give each market an isolated monotonic `seq` for per-market gap detection, but
+  production showed Kalshi's orderbook `seq` is per-*connection*, not per-`sid` — so
+  per-market gap detection was a false signal and is no longer used for resets (see
+  §6 and docs/INGEST-STABILIZATION-LOG.md §9). The
   (re)subscribe burst is **paced** (`WS_SUBSCRIBE_CHUNK` at a time, with a
   `WS_SUBSCRIBE_PACING_SECONDS` gap) so neither the outbound subscribes nor the
   inbound snapshot flood overwhelms the connection at anchor time — the empirical
@@ -559,12 +563,18 @@ the constant shifts the meaning but not the names.
 
 Reconstruction discipline lives in **`reconstruct.py`** (`BookReconstructor.apply`),
 not scattered across the snapshot loop: a **snapshot anchors** the book;
-**deltas** apply only while anchored and only for the next contiguous `seq`; a
-duplicate/old `seq` is dropped; a forward gap returns `RESET`. The snapshot
-builder just forwards drained events and, on `RESET`, calls the reset seam
-(`runtime.request_reset` — the one place that resets the in-memory book *and*
-enqueues the WS re-subscribe). Reset paths: sequence gap, structural canary, or
-audit large-diff.
+**deltas** apply only while anchored; a duplicate/replayed `seq` (≤ the last applied)
+is dropped; a **forward gap is tolerated** — resync `last_sequence` and apply.
+**Why tolerate (2026-06-08):** Kalshi's orderbook `seq` is per-*connection*, not
+per-market (production: the gap log's `got` is one counter climbing across every
+market while each market's `expected` is its own), so a forward jump is almost
+always *other* markets' deltas bumping the shared counter, not a missed delta for
+this market. Resetting on it produced a **perpetual reset storm** that left books
+de-anchored and the depth grid empty. **Reset paths are now: structural canary, or
+audit large-diff** — the two that don't depend on per-market `seq`; the snapshot/
+audit loops call the reset seam (`runtime.request_reset` — the one place that resets
+the in-memory book *and* enqueues the WS re-subscribe) directly. See
+docs/INGEST-STABILIZATION-LOG.md §9.
 
 ---
 
@@ -578,8 +588,10 @@ audit large-diff.
 - **REST (`rest.py`):** `/series`, `/events` (cursor-paginated, with nested
   markets), `/markets`, `/markets/{ticker}/orderbook`. Client-side token-bucket
   rate-limited; retries 429/5xx/transport errors with jittered backoff.
-- **WS (`kalshi/subscriber.py`):** envelope `{type, sid, seq, msg}`, `seq`
-  monotonic per subscription. Parses `orderbook_snapshot` / `orderbook_delta` /
+- **WS (`kalshi/subscriber.py`):** envelope `{type, sid, seq, msg}`. `seq` is
+  monotonic **per connection** (empirically — *not* per subscription/market as the
+  docs imply; see §6 + the stabilization log), so it's used only as a duplicate/
+  replay guard, not for per-market gap-reset. Parses `orderbook_snapshot` / `orderbook_delta` /
   `trade` / `market_lifecycle_v2` into `NormalizedEvent`s; never raises on a bad
   message (logs and drops). Hosts/paths per `KALSHI_ENV` live in `config.py`.
 - **Fixed-point (`kalshi/fixedpoint.py`):** the one module that decodes Kalshi's
