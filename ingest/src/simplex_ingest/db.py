@@ -424,6 +424,17 @@ class Database:
             ).fetchall()
         return {(r[0], r[1]) for r in rows}
 
+    def count_edges_classified_since(self, since: datetime) -> int:
+        """How many edges were written at/after ``since`` (naive UTC). Drives the
+        per-day Stage-B spend budget (``EXTRACTION_MAX_PAIRS_PER_DAY``) — the count
+        of new pair classifications already completed in the current window."""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT count(*) FROM market_edges WHERE classified_at >= ?",
+                [naive_utc(since)],
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def upsert_edges(self, rows: list[tuple[Any, ...]]) -> None:
         """Idempotent upsert of typed edges, keyed on the canonical pair.
 

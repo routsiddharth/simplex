@@ -61,6 +61,18 @@ def test_get_classified_pairs_filters_by_version(tmp_db):
     assert tmp_db.get_classified_pairs(V) == {("A", "B")}
 
 
+def test_count_edges_classified_since(tmp_db):
+    # Two edges classified "yesterday", one "today"; the boundary counts only today's.
+    yest = datetime(2026, 1, 1)
+    today = datetime(2026, 1, 2, 12)
+    def _at(a, b, ts):
+        return (C.PLATFORM, a, b, "correlated", "none", 0.7, "soft", "single", "w",
+                C.PAIR_MODEL, None, V, ts, "{}")
+    tmp_db.upsert_edges([_at("A", "B", yest), _at("A", "C", yest), _at("B", "C", today)])
+    assert tmp_db.count_edges_classified_since(datetime(2026, 1, 2)) == 1
+    assert tmp_db.count_edges_classified_since(datetime(2026, 1, 1)) == 3
+
+
 def test_reclassification_preserves_human_review_decision(tmp_db):
     # An edge lands in the review queue and a human approves it.
     tmp_db.upsert_edges([_edge_row("A", "B", tier="review", rel="implies")])

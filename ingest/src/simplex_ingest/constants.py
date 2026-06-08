@@ -397,6 +397,19 @@ model spend and keeps a cycle short enough to heartbeat comfortably; the backlog
 drains over subsequent cycles. Work is idempotent, so a partial cycle just
 resumes next tick."""
 
+EXTRACTION_MAX_PAIRS_PER_DAY = 2000
+"""Hard ceiling on **new** Stage-B pair classifications dispatched per UTC day
+(sync classified + batch submitted), counting work already done or in flight that
+day. The time-to-resolution gate (`route_pair`) cannot bound volume for a
+long-lived event set — a multi-week tournament puts every pair >48h out, so it all
+routes to batch and nothing is skipped (see docs/LLM-CALL-REDUCTION.md §1.2/§5.1).
+This budget is the bound the gate can't provide: it converts an unbounded backfill
+burst (≈121k pairs at full World-Cup scale) into a predictable daily spend. Pairs
+are dispatched **value-ordered** (longest remaining life first — best amortization)
+so the budget buys the highest-signal edges first; the remainder is deferred to
+later days and logged (never silently dropped). Set to 0 to pause all new pair
+spend; raise once the candidate set is shrunk (tighter predicates / embeddings)."""
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 """OpenRouter's OpenAI-compatible API root. Not a secret (the API *key* is, and
 lives in the env per config.py)."""
@@ -453,10 +466,26 @@ LLM_REQUEST_TIMEOUT_SECONDS = 60.0
 """Per-request timeout for a chat completion. Reasoning models on hard pairs can
 be slow; generous so a slow-but-valid response isn't dropped."""
 
-PAIR_ENTITY_OVERLAP_MIN = 2
-"""Minimum shared normalized entities for two markets in different events/series
-to become a candidate pair. 2 avoids pairing on a single common entity (e.g. a
-year or a country) while still catching genuinely-related cross-series markets."""
+PAIR_ENTITY_OVERLAP_MIN = 3
+"""Minimum shared normalized entities for two markets to become a candidate pair
+on the entity-overlap basis. **Raised 2 → 3 (2026-06-08)** per
+docs/LLM-CALL-REDUCTION.md §4.4: at the World-Cup scale the ≥2 rule created
+near-cliques among every market naming the same two teams (average candidate degree
+≈186 — mostly noise), so the bulk of pairs came back `unrelated`. Requiring 3 shared
+entities keeps genuinely-related markets (same match + same prop family) while
+cutting the noisy tail. This is a stopgap; the principled replacement is semantic-
+similarity candidate generation (embeddings, §4.2), at which point this predicate is
+retired. Same-event pairing is unaffected (always on); same-series-only pairing is
+gated by ``PAIR_ON_SAME_SERIES``."""
+
+PAIR_ON_SAME_SERIES = False
+"""Whether two markets in the same series (but different event) are a candidate
+**purely** on that basis. **Disabled (2026-06-08)** per docs/LLM-CALL-REDUCTION.md
+§4.4: same-series-only pairing was a large, low-value bucket (a series fans out
+wide), and same-series pairs that are genuinely related still surface via shared
+entities (``PAIR_ENTITY_OVERLAP_MIN``) or a shared event. Same-*event* pairing
+(Kalshi already grouped those) is always on, independent of this flag. Set True to
+restore the old behavior."""
 
 EDGE_TRUSTED_CONFIDENCE = 0.85
 """At/above this primary-model confidence, an edge is a *candidate* for the

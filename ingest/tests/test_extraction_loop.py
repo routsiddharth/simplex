@@ -154,6 +154,49 @@ async def test_classify_skips_on_llm_error(tmp_db, make_runtime, make_fake_llm, 
     assert any("pair classification skipped" in r.message for r in caplog.records)
 
 
+# -- per-day spend budget (LLM-CALL-REDUCTION §5.1) -------------------------
+
+def _setup_triplet(tmp_db, make_fake_llm, make_runtime):
+    """Three subscribed same-event markets with semantics -> 3 candidate pairs."""
+    ids = ("A", "B", "C")
+    tmp_db.upsert_markets([_market_row(m, event="E") for m in ids])
+    for mid in ids:
+        tmp_db.upsert_market_semantics([(
+            mid, C.PLATFORM, "ev", "yes", "no", "soon", json.dumps([]), json.dumps([]),
+            C.EXTRACTION_MODEL, C.EXTRACTION_PROMPT_VERSION, T0, "{}",
+        )])
+    tmp_db.set_active_set(set(ids))
+    llm = make_fake_llm()
+    return ExtractionLoop(make_runtime(tmp_db, llm=llm)), llm
+
+
+async def test_budget_zero_defers_all(tmp_db, make_runtime, make_fake_llm, monkeypatch, caplog):
+    monkeypatch.setattr(C, "EXTRACTION_MAX_PAIRS_PER_DAY", 0)
+    loop, llm = _setup_triplet(tmp_db, make_fake_llm, make_runtime)
+    with caplog.at_level(logging.INFO):
+        n = await loop._classify_pairs()
+    assert n == 0
+    assert llm.classify_calls == []  # nothing dispatched
+    routing = [r for r in caplog.records if "pair routing" in r.message][0]
+    assert routing.deferred == 3 and routing.budget_remaining == 0
+
+
+async def test_budget_caps_dispatch(tmp_db, make_runtime, make_fake_llm, monkeypatch):
+    monkeypatch.setattr(C, "EXTRACTION_MAX_PAIRS_PER_DAY", 1)
+    loop, _ = _setup_triplet(tmp_db, make_fake_llm, make_runtime)
+    n = await loop._classify_pairs()
+    assert n == 1  # only one of the three pairs spent, the rest deferred
+
+
+async def test_budget_counts_today_already_done(tmp_db, make_runtime, make_fake_llm, monkeypatch):
+    # Budget of 2: first cycle spends 2; second cycle sees the 2 done today and
+    # defers the remaining candidate.
+    monkeypatch.setattr(C, "EXTRACTION_MAX_PAIRS_PER_DAY", 2)
+    loop, _ = _setup_triplet(tmp_db, make_fake_llm, make_runtime)
+    assert await loop._classify_pairs() == 2
+    assert await loop._classify_pairs() == 0  # budget exhausted for the day
+
+
 # -- soft-fail without a key -----------------------------------------------
 
 async def test_disabled_without_llm_is_noop(tmp_db, make_runtime):

@@ -97,18 +97,30 @@ def _entities(market: dict) -> set[str]:
 
 
 def candidate_pairs(
-    markets: list[dict], *, entity_overlap_min: int | None = None
-) -> list[tuple[str, str]]:
+    markets: list[dict],
+    *,
+    entity_overlap_min: int | None = None,
+    on_same_series: bool | None = None,
+    return_breakdown: bool = False,
+):
     """Canonical, de-duplicated candidate pairs from ``markets``.
 
     Each market dict needs ``market_id`` and, optionally, ``series_ticker`` /
     ``event_ticker`` / ``entities``. ``entity_overlap_min`` defaults to
-    ``constants.PAIR_ENTITY_OVERLAP_MIN``.
+    ``constants.PAIR_ENTITY_OVERLAP_MIN``; ``on_same_series`` (default
+    ``constants.PAIR_ON_SAME_SERIES``) controls whether same-series-but-different-
+    event markets pair purely on that basis — see docs/LLM-CALL-REDUCTION.md §4.4.
+
+    Returns the sorted list of pairs. When ``return_breakdown`` is True, returns
+    ``(pairs, counts)`` where ``counts`` is ``{"event", "series", "entity",
+    "total"}`` — per-bucket *membership* sizes (a pair can be in several buckets, so
+    they sum to ≥ total) for the ``pair routing`` log line that tells us which bucket
+    drives the candidate count.
     """
     if entity_overlap_min is None:
         entity_overlap_min = C.PAIR_ENTITY_OVERLAP_MIN
-
-    pairs: set[tuple[str, str]] = set()
+    if on_same_series is None:
+        on_same_series = C.PAIR_ON_SAME_SERIES
 
     by_event: dict[str, set[str]] = defaultdict(set)
     by_series: dict[str, set[str]] = defaultdict(set)
@@ -125,10 +137,16 @@ def candidate_pairs(
         for e in _entities(m):
             by_entity[e].add(mid)
 
-    # Hierarchy buckets: every within-bucket pair is a candidate.
-    for bucket in (*by_event.values(), *by_series.values()):
+    event_pairs: set[tuple[str, str]] = set()
+    for bucket in by_event.values():
         for a, b in combinations(sorted(bucket), 2):
-            pairs.add((a, b))
+            event_pairs.add((a, b))
+
+    series_pairs: set[tuple[str, str]] = set()
+    if on_same_series:
+        for bucket in by_series.values():
+            for a, b in combinations(sorted(bucket), 2):
+                series_pairs.add((a, b))
 
     # Entity overlap: a pair co-occurs in one entity bucket per shared entity, so
     # counting co-occurrences yields |entities(a) ∩ entities(b)| directly.
@@ -138,8 +156,16 @@ def candidate_pairs(
             continue
         for a, b in combinations(sorted(mids), 2):
             shared[(a, b)] += 1
-    for pair, overlap in shared.items():
-        if overlap >= entity_overlap_min:
-            pairs.add(pair)
+    entity_pairs = {pair for pair, overlap in shared.items() if overlap >= entity_overlap_min}
 
-    return sorted(pairs)
+    pairs = event_pairs | series_pairs | entity_pairs
+    result = sorted(pairs)
+    if not return_breakdown:
+        return result
+    counts = {
+        "event": len(event_pairs),
+        "series": len(series_pairs),
+        "entity": len(entity_pairs),
+        "total": len(pairs),
+    }
+    return result, counts

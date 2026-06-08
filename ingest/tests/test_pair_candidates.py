@@ -27,9 +27,39 @@ def test_same_event_is_candidate():
     assert candidate_pairs(markets) == [("A", "B")]
 
 
-def test_same_series_is_candidate():
+def test_same_series_only_is_not_candidate_by_default():
+    # LLM-CALL-REDUCTION §4.4: same-series-only pairing is OFF by default now.
     markets = [_m("A", series="S1"), _m("B", series="S1"), _m("C", series="S2")]
-    assert candidate_pairs(markets) == [("A", "B")]
+    assert candidate_pairs(markets) == []
+
+
+def test_same_series_is_candidate_when_flag_on():
+    markets = [_m("A", series="S1"), _m("B", series="S1"), _m("C", series="S2")]
+    assert candidate_pairs(markets, on_same_series=True) == [("A", "B")]
+
+
+def test_default_entity_overlap_min_is_three():
+    # Two shared entities no longer suffices at the default (raised 2 -> 3).
+    two = [_m("A", entities=["x", "y"]), _m("B", entities=["x", "y"])]
+    assert candidate_pairs(two) == []
+    three = [_m("A", entities=["x", "y", "z"]), _m("B", entities=["x", "y", "z"])]
+    assert candidate_pairs(three) == [("A", "B")]
+
+
+def test_return_breakdown_counts_buckets():
+    # A,B: same event AND 3 shared entities. C,D: same series only.
+    markets = [
+        _m("A", event="E", entities=["x", "y", "z"]),
+        _m("B", event="E", entities=["x", "y", "z"]),
+        _m("C", series="S"),
+        _m("D", series="S"),
+    ]
+    pairs, counts = candidate_pairs(markets, on_same_series=True, return_breakdown=True)
+    assert ("A", "B") in pairs and ("C", "D") in pairs
+    assert counts["event"] == 1          # (A,B)
+    assert counts["series"] == 1         # (C,D)
+    assert counts["entity"] == 1         # (A,B) via 3 shared entities
+    assert counts["total"] == len(pairs)  # buckets overlap -> sum >= total
 
 
 def test_entity_overlap_meets_threshold():

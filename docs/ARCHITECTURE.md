@@ -408,6 +408,23 @@ in `supervisor.py`. Loops in `loops/`; their shared idle-with-heartbeat sleep is
     the *number* of calls (the O(n²) candidate set), not per-call length — which is
     what `PAIR_ENTITY_OVERLAP_MIN`, the time-to-resolution gate, and the
     verify-only-on-≥0.85 gate exist to bound.
+  - **Volume bounds — candidate tightening + a per-day budget (2026-06-08).** The
+    time-to-resolution gate cannot bound volume for a *long-lived* event set: a
+    multi-week tournament puts every pair >48h out, so all candidates route to batch
+    and none are skipped (live: 1,301 markets → 121,290 candidates, all batch). Two
+    additions bound it (see [`LLM-CALL-REDUCTION.md`](./LLM-CALL-REDUCTION.md)): (1)
+    tighter candidate generation — `PAIR_ENTITY_OVERLAP_MIN` raised 2→3 and
+    same-series-only pairing disabled (`PAIR_ON_SAME_SERIES=False`), since the ≥2
+    rule made near-cliques among markets naming the same teams (avg candidate degree
+    ≈186, mostly noise); same-*event* pairing is always on. (2) A hard per-UTC-day
+    Stage-B ceiling, `EXTRACTION_MAX_PAIRS_PER_DAY` — pairs are dispatched
+    value-ordered (longest remaining life first) up to the day's remaining budget
+    (counting work already done or in flight that day), and the overflow is
+    *deferred and logged*, never silently dropped. The `pair routing` log line now
+    also carries `todo` / `deferred` / `budget_remaining` and per-bucket counts
+    (`bucket_event`/`bucket_series`/`bucket_entity`) so the candidate-volume driver
+    is observable. These are stopgaps ahead of semantic-similarity (embedding)
+    candidate generation + cluster-classify (the doc's Phase 2).
 - **Batch state machine (submit-now / retrieve-later).** A batch crosses cycles:
   cycle *N* submits and persists `(batch_id, purpose, the work it covers, prompt
   version)` to the durable `llm_batches` table; a later cycle's **reconcile** phase

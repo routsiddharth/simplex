@@ -65,7 +65,14 @@ from ..llm import (
     parse_semantics,
 )
 from ..log import get_logger
-from ..pair_candidates import ROUTE_BATCH, ROUTE_SKIP, ROUTE_SYNC, candidate_pairs, route_pair
+from ..pair_candidates import (
+    ROUTE_BATCH,
+    ROUTE_SKIP,
+    ROUTE_SYNC,
+    candidate_pairs,
+    remaining_life_seconds,
+    route_pair,
+)
 from ..util import idle_sleep, naive_utc, now_utc
 
 log = get_logger("extraction")
@@ -130,6 +137,19 @@ def _tier_for(confidence: float) -> str:
     """Sub-trusted trust tier from a primary confidence (the band that needs no
     independent verify): ``soft`` or ``review``."""
     return "soft" if confidence >= C.EDGE_SOFT_CONFIDENCE else "review"
+
+
+def _pair_priority(ma: dict, mb: dict, now) -> float:
+    """Value key for the per-day budget ordering (docs/LLM-CALL-REDUCTION.md §5.1):
+    classify longest-remaining-life pairs first — an edge's spend amortizes over its
+    live life, so longer-lived edges are the higher-value buy. Unknown close time
+    sorts highest (classify conservatively rather than defer a possibly-useful edge).
+    """
+    lives = [
+        x for x in (remaining_life_seconds(ma, now), remaining_life_seconds(mb, now))
+        if x is not None
+    ]
+    return float("inf") if not lives else min(lives)
 
 
 class ExtractionLoop:
@@ -449,7 +469,7 @@ class ExtractionLoop:
         if len(markets) < 2:
             return 0
         by_id = {m["market_id"]: m for m in markets}
-        candidates = candidate_pairs(markets)
+        candidates, buckets = candidate_pairs(markets, return_breakdown=True)
         done = await asyncio.to_thread(self.rt.db.get_classified_pairs, C.EXTRACTION_PROMPT_VERSION)
         inflight = (
             await asyncio.to_thread(self.rt.db.get_inflight_pairs) if self._batch is not None else set()
@@ -458,8 +478,21 @@ class ExtractionLoop:
         if not todo:
             return 0
 
-        # Spend gate: bucket each candidate by remaining life.
         now = naive_utc(now_utc())
+
+        # Per-day spend budget — the volume bound the time gate can't provide for a
+        # long-lived event set (docs/LLM-CALL-REDUCTION.md §5.1). Consumed = pairs
+        # already classified today + pairs in flight today; spend the remainder
+        # value-first (longest remaining life amortizes best) and defer the rest to
+        # later days (logged, never silently dropped).
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        done_today = await asyncio.to_thread(self.rt.db.count_edges_classified_since, day_start)
+        budget = max(0, C.EXTRACTION_MAX_PAIRS_PER_DAY - done_today - len(inflight))
+        todo.sort(key=lambda p: _pair_priority(by_id[p[0]], by_id[p[1]], now), reverse=True)
+        deferred = max(0, len(todo) - budget)
+        todo = todo[:budget]
+
+        # Spend gate: bucket each budgeted candidate by remaining life.
         sync_pairs: list[tuple[str, str]] = []   # short-fuse — classify now
         batch_pairs: list[tuple[str, str]] = []  # long-horizon — discounted async
         for a, b in todo:
@@ -468,13 +501,18 @@ class ExtractionLoop:
                 continue
             (batch_pairs if route == ROUTE_BATCH else sync_pairs).append((a, b))
 
-        # Surface the gate in the deploy logs: skip is a real coverage cap (pairs
-        # below the floor are never classified), so it must be observable, not silent.
+        # Surface the gate AND the budget in the deploy logs: skip (below the life
+        # floor) and deferred (over today's budget) are both real coverage caps, so
+        # they must be observable, not silent. The bucket_* counts say which
+        # candidate-generation bucket drives the volume.
         n_skip = len(todo) - len(sync_pairs) - len(batch_pairs)
         log.info(
             "pair routing",
-            extra={"candidates": len(todo), "skip": n_skip,
-                   "sync": len(sync_pairs), "batch": len(batch_pairs)},
+            extra={"candidates": len(candidates), "todo": len(todo), "deferred": deferred,
+                   "budget_remaining": budget, "skip": n_skip,
+                   "sync": len(sync_pairs), "batch": len(batch_pairs),
+                   "bucket_event": buckets["event"], "bucket_series": buckets["series"],
+                   "bucket_entity": buckets["entity"]},
         )
 
         if self._batch is not None:
