@@ -125,6 +125,21 @@ def test_reset_canaries_flags_crossed_book():
     assert "crossed_book" in r.reset_canaries()
 
 
+def test_negative_size_is_not_a_reset_trigger():
+    # negative_size is the side-effect of tolerating per-connection seq gaps: a
+    # delta drives a level below zero. The book self-heals (clamps to zero) and we
+    # do NOT reset on it (2026-06-08) — only crossed_book / out_of_range do, and
+    # accumulated drift is corrected by the hourly REST audit. (Detection itself is
+    # covered by test_orderbook.test_canary_negative_size_from_delta.)
+    r = BookReconstructor("M")
+    r.apply(_snap([[0.40, 10]], [], seq=5))
+    r.apply(_delta("yes", 0.40, -50, seq=6))   # drives 0.40 below zero
+    assert 0.40 not in r.book.yes              # level clamped away (self-heal)
+    # reset_canaries() = check_canaries() & _RESET_CANARIES; negative_size is in the
+    # former but excluded from the latter, so the intersection is empty.
+    assert r.reset_canaries() == set()
+
+
 # -- out-of-range levels (the CA/MD primary reset-loop fix) -----------------
 
 def test_snapshot_drops_out_of_range_levels_no_canary():

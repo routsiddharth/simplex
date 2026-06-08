@@ -570,10 +570,15 @@ per-market (production: the gap log's `got` is one counter climbing across every
 market while each market's `expected` is its own), so a forward jump is almost
 always *other* markets' deltas bumping the shared counter, not a missed delta for
 this market. Resetting on it produced a **perpetual reset storm** that left books
-de-anchored and the depth grid empty. **Reset paths are now: structural canary, or
-audit large-diff** — the two that don't depend on per-market `seq`; the snapshot/
-audit loops call the reset seam (`runtime.request_reset` — the one place that resets
-the in-memory book *and* enqueues the WS re-subscribe) directly. See
+de-anchored and the depth grid empty. **Reset paths are now: the `crossed_book`
+canary (a crossed book corrupts the snapshot mid), or an audit large-diff** — the
+two that don't depend on per-market `seq`; the snapshot/audit loops call the reset
+seam (`runtime.request_reset` — the one place that resets the in-memory book *and*
+enqueues the WS re-subscribe) directly. The **`negative_size` canary no longer
+resets** (2026-06-08): it's the side-effect of tolerating gaps (a delta decremented
+a level we never saw incremented), the book self-heals by clamping the level to
+zero, and accumulated drift is corrected by the hourly REST **audit** — the
+authoritative per-market reconciliation — not per-event. See
 docs/INGEST-STABILIZATION-LOG.md §9.
 
 ---

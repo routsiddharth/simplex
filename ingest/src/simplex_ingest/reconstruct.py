@@ -35,7 +35,15 @@ from .orderbook import OrderBook
 log = get_logger("reconstruct")
 
 # Canaries that warrant a book reset (vs the informational stale-market check).
-_RESET_CANARIES = {"crossed_book", "negative_size", "out_of_range_price"}
+# `negative_size` is deliberately EXCLUDED (2026-06-08): it is the side-effect of
+# tolerating per-connection seq gaps (a delta decremented a level we never saw
+# incremented), the book already self-heals by clamping that level to zero, and
+# resetting on it just re-introduced churn for a minor, self-correcting
+# inconsistency. Genuine *accumulated* drift is corrected by the hourly REST audit
+# instead — the authoritative per-market reconciliation. `crossed_book` stays (a
+# crossed book corrupts the snapshot mid directly); `out_of_range_price` stays as a
+# defensive backstop though it's already filtered at apply time.
+_RESET_CANARIES = {"crossed_book", "out_of_range_price"}
 
 
 class ApplyResult(Enum):

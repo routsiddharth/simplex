@@ -375,12 +375,25 @@ silently without logging).
 gap — it resyncs `last_sequence` and applies the delta (the book is almost always
 fine; the "gap" was other markets). `seq` is kept only as a duplicate/replay guard
 (`seq ≤ last_sequence` → drop). The two **real** corruption backstops, which don't
-depend on per-market `seq`, are unchanged: the structural canaries (crossed book /
-negative size / out-of-range) and the hourly REST audit (in-memory book vs REST →
-reset on a large diff). Trade-off: we lose per-market *missed-delta* detection via
-`seq` — but it was non-functional (firing on a global counter), and for a 60 s grid
-with an hourly audit that's the right call. Expected: `resets` collapses to ~0,
-books stay anchored, the depth grid populates.
+depend on per-market `seq`, are unchanged: the structural canaries and the hourly
+REST audit (in-memory book vs REST → reset on a large diff). Trade-off: we lose
+per-market *missed-delta* detection via `seq` — but it was non-functional (firing on
+a global counter), and for a 60 s grid with an hourly audit that's the right call.
+Verified in production: `resets` 12.6k-and-climbing → ~2/min, `sequence gap` logs →
+0, books anchored, `events_per_s` into books 1–5 → 9.8–22.5.
+
+**Follow-on (same day): `negative_size` canary no longer resets.** After the gap
+fix, the residual ~2/min resets were `negative_size` canaries — the *side-effect* of
+tolerating gaps (a delta decremented a level we never saw incremented). The book
+already self-heals (clamps the level to zero), so resetting the whole book on top of
+that re-introduced churn for a minor, self-correcting inconsistency. `negative_size`
+is removed from `_RESET_CANARIES`; `crossed_book` (corrupts the snapshot mid) and
+`out_of_range_price` (defensive) stay. Accumulated drift is corrected by the hourly
+REST **audit** instead — the authoritative per-market reconciliation. **Watch item:**
+the first post-deploy audit showed `max_pct` up to 99% on some `KXWCTOTAL*` markets;
+if the *next* hourly audit still shows large diffs, gap-tolerance drift is not
+"minor" and we add a faster/lighter correction (periodic re-snapshot, or a shorter
+audit interval) rather than reinstating per-event resets.
 
 **Also:** quieted httpx/httpcore/websockets INFO logging (one `HTTP Request: …`
 line per catalog/discovery REST call was drowning the structured logs).
